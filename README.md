@@ -49,6 +49,10 @@ pio device monitor -b 115200
 
 The RGB pin defaults to GPIO 48. Override `KM_RGB_PIN` in `platformio.ini` for boards using GPIO 38 or another pin.
 
+## Model status
+
+The firmware now includes a first tiny hashed character n-gram intent classifier generated from `model/intents.jsonl`. It classifies `led.set`, `led.off`, and `unsupported`; color/brightness slot extraction remains deterministic. Retrain with `python3 model/train_ngram.py model/intents.jsonl --out model/intent_model.h`. The replaceable backend interface is in `include/model_backend.h`.
+
 ## Safety boundary
 
-Prompts are interpreted into allowlisted commands, then validated before hardware execution. The future model backend must emit the same command shape and cannot bypass validation.
+Prompts are interpreted into allowlisted commands, then validated before hardware execution. Any future model backend must emit the same command shape and cannot bypass validation.

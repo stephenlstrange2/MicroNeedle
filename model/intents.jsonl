@@ -1,0 +1,8 @@
+{"text":"turn the LED red","intent":"led.set","color":"red","brightness":80}
+{"text":"make the light orange","intent":"led.set","color":"orange","brightness":80}
+{"text":"set the LED to blue at 40 brightness","intent":"led.set","color":"blue","brightness":40}
+{"text":"show green","intent":"led.set","color":"green","brightness":80}
+{"text":"turn the light off","intent":"led.off"}
+{"text":"switch off the LED","intent":"led.off"}
+{"text":"what is the weather today","intent":"unsupported"}
+{"text":"play music","intent":"unsupported"}

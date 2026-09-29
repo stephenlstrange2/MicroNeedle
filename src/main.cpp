@@ -3,6 +3,8 @@
 #include <Adafruit_NeoPixel.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
+#include "model_backend.h"
+#include "intent_classifier.h"
 
 #ifndef KM_RGB_PIN
 #define KM_RGB_PIN 48
@@ -17,6 +19,7 @@ static constexpr uint16_t LED_COUNT = 1;
 
 Adafruit_NeoPixel pixel(LED_COUNT, KM_RGB_PIN, NEO_GRB + NEO_KHZ800);
 AsyncWebServer webServer(80);
+IntentClassifier intentClassifier;
 
 struct RgbValue {
   uint8_t r;
@@ -106,7 +109,15 @@ bool handlePrompt(const char *id, String prompt) {
   String normalized = prompt;
   normalized.trim();
   normalized.toLowerCase();
-  if (normalized.indexOf("off") >= 0 || normalized.indexOf("disable") >= 0) {
+
+  // The tiny on-device classifier gates prompt intent. Slot extraction remains
+  // deterministic for now; both paths still terminate in the tool validator.
+  IntentPrediction prediction = intentClassifier.predict(normalized);
+  if (strcmp(prediction.label, "unsupported") == 0 || prediction.confidence < 0.60f) {
+    sendError(id, "low_confidence", "Prompt intent was not recognized confidently");
+    return false;
+  }
+  if (strcmp(prediction.label, "led.off") == 0 || normalized.indexOf("off") >= 0 || normalized.indexOf("disable") >= 0) {
     setStatus(0, 0, 0, 0);
     sendSuccess(id);
     return true;

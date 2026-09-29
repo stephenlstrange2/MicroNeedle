@@ -63,9 +63,21 @@ The first prompt interface is serial JSON-lines and plain-text serial prompts. A
 
 The initial prompt backend is deterministic and intentionally narrow. It handles phrases such as `red`, `green`, `blue`, `orange`, `white`, `off`, and `set brightness to N`. The backend interface is replaceable by an on-device model or a remote model service.
 
-### 5. Model boundary
+### 5. On-device model track (current next phase)
 
-`ModelBackend` will eventually support:
+The first real AI target is the ESP32-S3 itself. We will start with a tiny intent classifier, not a general chat model:
+
+1. Define a fixed intent set (`led.set`, `led.off`, unsupported) and slot fields (`color`, `brightness`).
+2. Create a small labeled prompt dataset and a host-side training/evaluation script.
+3. Benchmark a compact quantized runtime on the N16R8, keeping the model and tensor arena in PSRAM where possible.
+4. Add confidence thresholds: high-confidence commands execute, uncertain commands require confirmation, and unsupported prompts are refused.
+5. Keep the deterministic parser as a fallback and test both backends against the same command validator.
+
+The first model is expected to be a classifier/slot extractor rather than an unrestricted language model. The recommended ESP32-S3 prototype is a tiny hashed character n-gram classifier with int8 weights exported as a C header; it avoids a heavyweight tokenizer/runtime and handles small spelling variations. TensorFlow Lite Micro or ESP-DL can be evaluated later if the model grows. A real Needle-sized generative model is a later ESP32-P4/Luckfox target.
+
+### 6. Model boundary
+
+`ModelBackend` will support:
 
 - No-model deterministic parsing on ESP32-S3.
 - Tiny classifier/slot extractor on ESP32-S3.
