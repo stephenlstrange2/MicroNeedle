@@ -12,7 +12,7 @@
 #define MICRONEEDLE_PROTOCOL_VERSION 1
 #endif
 
-static constexpr size_t MAX_INPUT = 768;
+static constexpr size_t MICRONEEDLE_MAX_INPUT = 768;
 static constexpr uint16_t LED_COUNT = 1;
 
 Adafruit_NeoPixel pixel(LED_COUNT, KM_RGB_PIN, NEO_GRB + NEO_KHZ800);
@@ -161,7 +161,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
 void handleLine(String line) {
   line.trim();
   if (!line.length()) return;
-  if (line.length() > MAX_INPUT) {
+  if (line.length() > MICRONEEDLE_MAX_INPUT) {
     sendError("", "input_too_large", "Input exceeds the maximum size");
     return;
   }
@@ -251,7 +251,7 @@ void loop() {
         handleLine(line);
         line = "";
       }
-    } else if (line.length() <= MAX_INPUT) {
+    } else if (line.length() <= MICRONEEDLE_MAX_INPUT) {
       line += c;
     }
   }
