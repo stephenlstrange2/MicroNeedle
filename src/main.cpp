@@ -53,6 +53,24 @@ void sendSuccess(const char *id) {
   Serial.println();
 }
 
+void sendPromptResponse(const char *id, const IntentPrediction &prediction,
+                        bool success, const char *errorCode = nullptr,
+                        const char *errorMessage = nullptr) {
+  JsonDocument response;
+  response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
+  response["id"] = id ? id : "";
+  response["success"] = success;
+  JsonObject result = response["result"].to<JsonObject>();
+  result["intent"] = prediction.label;
+  result["confidence"] = prediction.confidence;
+  if (!success) {
+    response["error"]["code"] = errorCode;
+    response["error"]["message"] = errorMessage;
+  }
+  serializeJson(response, Serial);
+  Serial.println();
+}
+
 void sendInfo(const char *id, bool capabilities) {
   JsonDocument response;
   response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
@@ -114,24 +132,24 @@ bool handlePrompt(const char *id, String prompt) {
   // deterministic for now; both paths still terminate in the tool validator.
   IntentPrediction prediction = intentClassifier.predict(normalized);
   if (strcmp(prediction.label, "unsupported") == 0 || prediction.confidence < 0.60f) {
-    sendError(id, "low_confidence", "Prompt intent was not recognized confidently");
+    sendPromptResponse(id, prediction, false, "low_confidence", "Prompt intent was not recognized confidently");
     return false;
   }
   if (strcmp(prediction.label, "led.off") == 0 || normalized.indexOf("off") >= 0 || normalized.indexOf("disable") >= 0) {
     setStatus(0, 0, 0, 0);
-    sendSuccess(id);
+    sendPromptResponse(id, prediction, true);
     return true;
   }
 
   RgbValue color;
   if (!parseColor(normalized, color)) {
-    sendError(id, "unsupported_prompt", "No supported LED color or action was found");
+    sendPromptResponse(id, prediction, false, "unsupported_prompt", "No supported LED color or action was found");
     return false;
   }
 
   uint8_t brightness = parseBrightness(normalized, 80);
   setStatus(color.r, color.g, color.b, brightness);
-  sendSuccess(id);
+  sendPromptResponse(id, prediction, true);
   return true;
 }
 
@@ -229,18 +247,33 @@ void setup() {
   Serial.println();
   if (WiFi.status() == WL_CONNECTED) {
     webServer.on("/health", HTTP_GET, [](AsyncWebServerRequest *request) {
-      request->send(200, "application/json", "{\\"ok\\":true,\\"protocol\\":1}");
+      request->send(200, "application/json", "{\"ok\":true,\"protocol\":1}");
     });
     webServer.on("/prompt", HTTP_GET, [](AsyncWebServerRequest *request) {
       if (!request->hasParam("text")) {
-        request->send(400, "application/json", "{\\"success\\":false,\\"error\\":\\"missing_text\\"}");
+        request->send(400, "application/json", "{\"success\":false,\"error\":\"missing_text\"}");
         return;
       }
       String prompt = request->getParam("text")->value();
       bool accepted = handlePrompt("http", prompt);
       request->send(accepted ? 200 : 422, "application/json",
-                    accepted ? "{\\"success\\":true}" : "{\\"success\\":false,\\"error\\":\\"unsupported_prompt\\"}");
+                    accepted ? "{\"success\":true}" : "{\"success\":false,\"error\":\"unsupported_prompt\"}");
     });
+    webServer.on("/prompt", HTTP_POST, [](AsyncWebServerRequest *request) {}, nullptr,
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        if (index != 0 || total > MICRONEEDLE_MAX_INPUT) {
+          if (index == 0) request->send(413, "application/json", "{\"success\":false,\"error\":\"input_too_large\"}");
+          return;
+        }
+        JsonDocument body;
+        if (deserializeJson(body, data, len) || !body["prompt"].is<const char *>()) {
+          request->send(400, "application/json", "{\"success\":false,\"error\":\"invalid_prompt_json\"}");
+          return;
+        }
+        bool accepted = handlePrompt("http", body["prompt"].as<String>());
+        request->send(accepted ? 200 : 422, "application/json",
+                      accepted ? "{\"success\":true}" : "{\"success\":false,\"error\":\"prompt_rejected\"}");
+      });
     webServer.begin();
     Serial.print("HTTP prompt endpoint: http://");
     Serial.print(WiFi.localIP());

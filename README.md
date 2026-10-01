@@ -23,6 +23,7 @@ If `MICRONEEDLE_WIFI_SSID` and `MICRONEEDLE_WIFI_PASSWORD` are defined in `build
 ```text
 GET /health
 GET /prompt?text=turn%20the%20LED%20orange
+POST /prompt  {"prompt":"turn the LED orange"}
 ```
 
 Serial remains available if Wi-Fi is not configured or cannot connect.
@@ -51,7 +52,7 @@ The RGB pin defaults to GPIO 48. Override `KM_RGB_PIN` in `platformio.ini` for b
 
 ## Model status
 
-The firmware now includes a first tiny hashed character n-gram intent classifier generated from `model/intents.jsonl`. It classifies `led.set`, `led.off`, and `unsupported`; color/brightness slot extraction remains deterministic. Retrain with `python3 model/train_ngram.py model/intents.jsonl --out model/intent_model.h`. The replaceable backend interface is in `include/model_backend.h`.
+The firmware now includes a first tiny hashed character n-gram intent classifier generated from `model/intents.jsonl`. It classifies `led.set`, `led.off`, and `unsupported`; color/brightness slot extraction remains deterministic. Prompt responses include the predicted intent and confidence. Retrain with `python3 model/train_ngram.py model/intents.jsonl --out model/intent_model.h`. The replaceable backend interface is in `include/model_backend.h`.
 
 ## Safety boundary
 

@@ -2,7 +2,29 @@
 {"text":"make the light orange","intent":"led.set","color":"orange","brightness":80}
 {"text":"set the LED to blue at 40 brightness","intent":"led.set","color":"blue","brightness":40}
 {"text":"show green","intent":"led.set","color":"green","brightness":80}
+{"text":"make it crimson","intent":"led.set","color":"red","brightness":80}
+{"text":"light up the strip purple","intent":"led.set","color":"purple","brightness":80}
+{"text":"change the lamp to yellow","intent":"led.set","color":"yellow","brightness":80}
+{"text":"set color to white","intent":"led.set","color":"white","brightness":80}
+{"text":"make the light pink and bright","intent":"led.set","color":"pink","brightness":255}
+{"text":"turn it blue at brightness 10","intent":"led.set","color":"blue","brightness":10}
+{"text":"dim the orange LED to brightness 25","intent":"led.set","color":"orange","brightness":25}
+{"text":"use green at 100 brightness","intent":"led.set","color":"green","brightness":100}
+{"text":"switch the light on red","intent":"led.set","color":"red","brightness":80}
+{"text":"please illuminate blue","intent":"led.set","color":"blue","brightness":80}
+{"text":"turn the LED red please","intent":"led.set","color":"red","brightness":80}
 {"text":"turn the light off","intent":"led.off"}
 {"text":"switch off the LED","intent":"led.off"}
+{"text":"disable the light","intent":"led.off"}
+{"text":"stop the LED","intent":"led.off"}
+{"text":"make the LED dark","intent":"led.off"}
+{"text":"no light","intent":"led.off"}
+{"text":"turn everything off","intent":"led.off"}
 {"text":"what is the weather today","intent":"unsupported"}
 {"text":"play music","intent":"unsupported"}
+{"text":"tell me a joke","intent":"unsupported"}
+{"text":"open the garage door","intent":"unsupported"}
+{"text":"send an email","intent":"unsupported"}
+{"text":"what time is it","intent":"unsupported"}
+{"text":"connect to bluetooth","intent":"unsupported"}
+{"text":"take a photograph","intent":"unsupported"}
