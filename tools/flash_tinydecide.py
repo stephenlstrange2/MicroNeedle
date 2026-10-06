@@ -33,7 +33,7 @@ def main() -> int:
     command += ["--chip", "esp32s3"]
     if args.port:
         command += ["--port", args.port]
-    command += ["--baud", args.baud, "write_flash", OFFSET, str(IMAGE)]
+    command += ["--baud", args.baud, "write-flash", OFFSET, str(IMAGE)]
     print("+", " ".join(command))
     try:
         return subprocess.run(command, check=False).returncode

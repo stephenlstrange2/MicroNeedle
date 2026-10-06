@@ -63,6 +63,72 @@ bool TinyDecideBackend::begin() {
   return ready_;
 }
 
+DeviceRouteResult TinyDecideBackend::routeDevice(const String &prompt,
+                                                   const char *const *deviceNames,
+                                                   size_t deviceCount) {
+  DeviceRouteResult result;
+  if (!ready_ || !deviceNames || deviceCount == 0 || deviceCount > 31) {
+    result.error = ready_ ? "invalid_device_options" : "model_not_ready";
+    return result;
+  }
+  if (xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE) {
+    result.error = "model_busy";
+    return result;
+  }
+
+  static const char *const operations[] = {
+      "turn a registered device on",
+      "turn a registered device off",
+      "read a registered device state",
+      "unsupported request",
+  };
+  const char *targets[32]{};
+  for (size_t i = 0; i < deviceCount; ++i) targets[i] = deviceNames[i];
+  targets[deviceCount] = "unknown device";
+  const td::Question questions[] = {
+      {td::CHOICE, "Which operation should handle this message?", operations, 4},
+      {td::CHOICE, "Which registered device did the user name?", targets,
+       static_cast<int>(deviceCount + 1)},
+  };
+  td::Answer routeAnswers[2]{};
+  td::Info info{};
+  const td::Status status = td::answer(prompt.c_str(), questions, 2, routeAnswers, &info);
+  result.elapsedMs = info.ms;
+  result.tokens = info.tokens;
+  result.truncated = info.truncated;
+  if (status != td::OK) {
+    result.error = td::statusText(status);
+    xSemaphoreGive(mutex_);
+    return result;
+  }
+
+  const int operation = routeAnswers[0].pick;
+  result.targetIndex = routeAnswers[1].pick;
+  if (info.truncated || operation < 0 || operation >= 4 || result.targetIndex < 0 ||
+      result.targetIndex > static_cast<int>(deviceCount)) {
+    result.action = DeviceRouteResult::UNSUPPORTED;
+    result.error = info.truncated ? "input_truncated" : "invalid_model_choice";
+    xSemaphoreGive(mutex_);
+    return result;
+  }
+  result.confidence = routeAnswers[0].probs[operation];
+  result.targetConfidence = routeAnswers[1].probs[result.targetIndex];
+  if (operation == 3 || static_cast<size_t>(result.targetIndex) >= deviceCount ||
+      result.confidence < 0.70f || result.targetConfidence < 0.60f) {
+    result.action = DeviceRouteResult::UNSUPPORTED;
+  } else if (operation == 0) {
+    result.action = DeviceRouteResult::SET_ON;
+  } else if (operation == 1) {
+    result.action = DeviceRouteResult::SET_OFF;
+  } else if (operation == 2) {
+    result.action = DeviceRouteResult::GET_STATE;
+  } else {
+    result.action = DeviceRouteResult::UNSUPPORTED;
+  }
+  xSemaphoreGive(mutex_);
+  return result;
+}
+
 TinyDecideResult TinyDecideBackend::interpret(const String &prompt) {
   TinyDecideResult result;
   if (!ready_) {
@@ -86,6 +152,12 @@ TinyDecideResult TinyDecideBackend::interpret(const String &prompt) {
   }
 
   const int action = answers[0].pick;
+  if (info.truncated || action < 0 || action >= 3) {
+    result.action = TinyDecideResult::UNSUPPORTED;
+    result.error = info.truncated ? "input_truncated" : "invalid_model_choice";
+    xSemaphoreGive(mutex_);
+    return result;
+  }
   result.confidence = answers[0].probs[action];
   result.decisionConfidence = answers[0].confidence;
   if (action == 2 || result.confidence < ACTION_THRESHOLD) {
@@ -100,8 +172,14 @@ TinyDecideResult TinyDecideBackend::interpret(const String &prompt) {
   }
 
   const int color = answers[1].pick;
+  if (color < 0 || color >= 9) {
+    result.action = TinyDecideResult::UNSUPPORTED;
+    result.error = "invalid_model_choice";
+    xSemaphoreGive(mutex_);
+    return result;
+  }
   result.colorConfidence = answers[1].probs[color];
-  if (color < 0 || color >= 8 || result.colorConfidence < COLOR_THRESHOLD) {
+  if (color >= 8 || result.colorConfidence < COLOR_THRESHOLD) {
     result.action = TinyDecideResult::UNSUPPORTED;
     result.error = "color_not_grounded";
     xSemaphoreGive(mutex_);

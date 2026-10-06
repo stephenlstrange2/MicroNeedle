@@ -6,6 +6,9 @@
 #include "model_backend.h"
 #include "intent_classifier.h"
 #include "tinydecide_backend.h"
+#include "device_registry.h"
+#include "task_executor.h"
+#include "confirmation_manager.h"
 
 #ifndef KM_RGB_PIN
 #define KM_RGB_PIN 48
@@ -22,6 +25,9 @@ Adafruit_NeoPixel pixel(LED_COUNT, KM_RGB_PIN, NEO_GRB + NEO_KHZ800);
 AsyncWebServer webServer(80);
 IntentClassifier intentClassifier;
 TinyDecideBackend tinyDecide;
+DeviceRegistry deviceRegistry;
+TaskExecutor taskExecutor(deviceRegistry);
+ConfirmationManager confirmations;
 
 struct RgbValue {
   uint8_t r;
@@ -51,6 +57,141 @@ void sendSuccess(const char *id) {
   response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
   response["id"] = id ? id : "";
   response["success"] = true;
+  serializeJson(response, Serial);
+  Serial.println();
+}
+
+void sendTaskAccepted(const char *id, uint32_t taskId, const char *tool,
+                      const char *backend = nullptr, float confidence = -1.0f) {
+  JsonDocument response;
+  response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
+  response["id"] = id ? id : "";
+  response["success"] = true;
+  JsonObject task = response["task"].to<JsonObject>();
+  task["id"] = taskId;
+  task["tool"] = tool;
+  task["status"] = "queued";
+  if (backend) response["model"]["backend"] = backend;
+  if (confidence >= 0.0f) response["model"]["confidence"] = confidence;
+  serializeJson(response, Serial);
+  Serial.println();
+}
+
+void sendConfirmation(const char *id, uint32_t confirmationId, const TaskRequest &proposal) {
+  JsonDocument response;
+  response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
+  response["id"] = id ? id : "";
+  response["success"] = false;
+  response["requires_confirmation"] = true;
+  response["confirmation_id"] = confirmationId;
+  response["confirmation_prompt"] = String("confirm ") + confirmationId;
+  response["expires_in_seconds"] = 30;
+  JsonObject proposed = response["proposed"].to<JsonObject>();
+  proposed["tool"] = TaskExecutor::operationName(proposal.operation);
+  JsonObject args = proposed["args"].to<JsonObject>();
+  args["alias"] = proposal.alias;
+  if (proposal.operation == TaskOperation::DEVICE_BIND) {
+    args["driver"] = "gpio.output";
+    args["pin"] = proposal.pin;
+    args["active_level"] = proposal.activeHigh ? "high" : "low";
+    args["startup_state"] = proposal.startupOn ? "on" : "off";
+  } else if (proposal.operation == TaskOperation::DEVICE_RENAME) {
+    args["new_alias"] = proposal.newAlias;
+  }
+  serializeJson(response, Serial);
+  Serial.println();
+}
+
+bool proposeConfirmation(const char *id, const TaskRequest &request) {
+  const uint32_t confirmationId = confirmations.propose(request);
+  if (!confirmationId) {
+    sendError(id, "confirmation_capacity_full", "Too many pending confirmations");
+    return false;
+  }
+  sendConfirmation(id, confirmationId, request);
+  return true;
+}
+
+bool submitTask(const char *id, const TaskRequest &request, const char *backend = nullptr,
+                float confidence = -1.0f) {
+  uint32_t taskId = 0;
+  const char *error = nullptr;
+  if (!taskExecutor.submit(request, taskId, &error)) {
+    sendError(id, error ? error : "task_submit_failed", "Task could not be queued");
+    return false;
+  }
+  sendTaskAccepted(id, taskId, TaskExecutor::operationName(request.operation), backend, confidence);
+  return true;
+}
+
+void sendDeviceList(const char *id) {
+  JsonDocument response;
+  response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
+  response["id"] = id ? id : "";
+  response["success"] = true;
+  JsonArray devices = response["result"]["devices"].to<JsonArray>();
+  for (size_t i = 0; i < MICRONEEDLE_MAX_DEVICES; ++i) {
+    const DeviceBinding *binding = deviceRegistry.bindingAt(i);
+    if (!binding || !binding->occupied) continue;
+    JsonObject device = devices.add<JsonObject>();
+    device["id"] = binding->id;
+    device["alias"] = binding->alias;
+    device["display_name"] = binding->displayName;
+    device["driver"] = "gpio.output";
+    device["pin"] = binding->pin;
+    device["active_level"] = binding->activeHigh ? "high" : "low";
+    device["state"] = binding->currentOn ? "on" : "off";
+  }
+  serializeJson(response, Serial);
+  Serial.println();
+}
+
+void sendDeviceDescription(const char *id, const char *alias) {
+  const DeviceBinding *binding = deviceRegistry.find(alias);
+  if (!binding) {
+    sendError(id, "device_not_found", "No registered device has that alias");
+    return;
+  }
+  JsonDocument response;
+  response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
+  response["id"] = id ? id : "";
+  response["success"] = true;
+  JsonObject device = response["result"]["device"].to<JsonObject>();
+  device["id"] = binding->id;
+  device["alias"] = binding->alias;
+  device["display_name"] = binding->displayName;
+  device["driver"] = "gpio.output";
+  device["pin"] = binding->pin;
+  device["active_level"] = binding->activeHigh ? "high" : "low";
+  device["startup_state"] = binding->startupOn ? "on" : "off";
+  device["state"] = binding->currentOn ? "on" : "off";
+  JsonArray capabilities = device["capabilities"].to<JsonArray>();
+  if (binding->capabilities & CAP_ON) capabilities.add("on");
+  if (binding->capabilities & CAP_OFF) capabilities.add("off");
+  if (binding->capabilities & CAP_STATE) capabilities.add("state");
+  serializeJson(response, Serial);
+  Serial.println();
+}
+
+void sendTaskRecord(const char *id, const TaskRecord &record, bool event = false) {
+  JsonDocument response;
+  if (event) response["event"] = String("task.") + TaskExecutor::statusName(record.status);
+  else {
+    response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
+    response["id"] = id ? id : "";
+    response["success"] = true;
+  }
+  JsonObject task = response["task"].to<JsonObject>();
+  task["id"] = record.id;
+  task["tool"] = TaskExecutor::operationName(record.request.operation);
+  task["status"] = TaskExecutor::statusName(record.status);
+  task["alias"] = record.request.alias;
+  if (record.status == TaskStatus::COMPLETED &&
+      (record.request.operation == TaskOperation::DEVICE_GET ||
+       record.request.operation == TaskOperation::DEVICE_SET)) {
+    task["result"]["state"] = record.resultState ? "on" : "off";
+  }
+  if (record.error[0]) task["error"] = record.error;
   serializeJson(response, Serial);
   Serial.println();
 }
@@ -115,7 +256,7 @@ void sendInfo(const char *id, bool capabilities) {
   response["id"] = id ? id : "";
   response["success"] = true;
   JsonObject result = response["result"].to<JsonObject>();
-  result["firmware"] = "microneedle-0.1.0";
+  result["firmware"] = "microneedle-0.2.0";
   result["protocol"] = MICRONEEDLE_PROTOCOL_VERSION;
   result["chip"] = ESP.getChipModel();
   result["cpu_mhz"] = ESP.getCpuFreqMHz();
@@ -130,7 +271,20 @@ void sendInfo(const char *id, bool capabilities) {
     tools.add("device.capabilities");
     tools.add("led.set");
     tools.add("led.off");
-    tools.add("led.pattern");
+    tools.add("device.bind");
+    tools.add("device.unbind");
+    tools.add("device.rename");
+    tools.add("device.list");
+    tools.add("device.describe");
+    tools.add("device.get");
+    tools.add("device.set");
+    tools.add("task.status");
+    tools.add("task.cancel");
+    tools.add("task.list");
+    tools.add("confirmation.confirm");
+    result["board_profile"] = BoardProfile::name();
+    result["device_count"] = deviceRegistry.count();
+    result["task_capacity"] = MICRONEEDLE_MAX_TASKS;
   }
   serializeJson(response, Serial);
   Serial.println();
@@ -172,10 +326,208 @@ bool validateAndSetLed(int r, int g, int b, int brightness) {
   return true;
 }
 
+bool validAliasInput(const char *alias) {
+  if (!alias) return false;
+  const size_t length = strlen(alias);
+  if (!length || length >= MICRONEEDLE_ALIAS_SIZE) return false;
+  char normalized[MICRONEEDLE_ALIAS_SIZE];
+  return DeviceRegistry::normalizeAlias(alias, normalized, sizeof(normalized));
+}
+
+bool containsAliasWords(const String &normalized, String alias) {
+  alias.toLowerCase();
+  alias.replace('_', ' ');
+  String paddedText = " " + normalized + " ";
+  String paddedAlias = " " + alias + " ";
+  return paddedText.indexOf(paddedAlias) >= 0;
+}
+
+bool parseUnsignedAfter(const String &text, int start, uint32_t &value) {
+  while (start < static_cast<int>(text.length()) && !isDigit(text[start])) ++start;
+  if (start >= static_cast<int>(text.length())) return false;
+  String number;
+  while (start < static_cast<int>(text.length()) && isDigit(text[start])) number += text[start++];
+  value = number.toInt();
+  return number.length() > 0;
+}
+
+bool handleConfigurationPrompt(const char *id, const String &normalized, bool &handled) {
+  handled = true;
+  if (normalized.startsWith("confirm ")) {
+    uint32_t confirmationId = 0;
+    if (!parseUnsignedAfter(normalized, 7, confirmationId)) {
+      sendError(id, "invalid_confirmation", "Expected: confirm <confirmation_id>");
+      return false;
+    }
+    TaskRequest request;
+    const char *error = nullptr;
+    if (!confirmations.confirm(confirmationId, request, &error)) {
+      sendError(id, error, "Confirmation is missing or expired");
+      return false;
+    }
+    return submitTask(id, request);
+  }
+
+  if (normalized.startsWith("bind gpio ") || normalized.startsWith("assign gpio ")) {
+    const bool bindForm = normalized.startsWith("bind gpio ");
+    uint32_t pin = 0;
+    if (!parseUnsignedAfter(normalized, bindForm ? 9 : 11, pin) || pin > 255) {
+      sendError(id, "invalid_bind_prompt", "Expected: bind GPIO <pin> as <alias>");
+      return false;
+    }
+    String alias;
+    if (bindForm) {
+      const int asPosition = normalized.indexOf(" as ");
+      if (asPosition >= 0) alias = normalized.substring(asPosition + 4);
+    } else {
+      int aliasPosition = normalized.indexOf(" called ");
+      if (aliasPosition >= 0) alias = normalized.substring(aliasPosition + 8);
+      else {
+        aliasPosition = normalized.indexOf(" to ");
+        if (aliasPosition >= 0) alias = normalized.substring(aliasPosition + 4);
+      }
+    }
+    alias.trim();
+    if (alias.startsWith("an alias ")) alias.remove(0, 9);
+    else if (alias.startsWith("a ")) alias.remove(0, 2);
+    else if (alias.startsWith("an ")) alias.remove(0, 3);
+    if (!validAliasInput(alias.c_str())) {
+      sendError(id, "invalid_alias", "Alias must be 1-31 letters, digits, spaces, dashes, or underscores");
+      return false;
+    }
+    const char *pinReason = nullptr;
+    if (!BoardProfile::canBindOutput(static_cast<uint8_t>(pin), &pinReason) ||
+        deviceRegistry.pinClaimed(static_cast<uint8_t>(pin))) {
+      sendError(id, "unsafe_or_claimed_pin", pinReason ? pinReason : "Pin is already claimed");
+      return false;
+    }
+    TaskRequest request;
+    request.operation = TaskOperation::DEVICE_BIND;
+    request.priority = TaskPriority::INTERACTIVE;
+    request.pin = static_cast<uint8_t>(pin);
+    strlcpy(request.alias, alias.c_str(), sizeof(request.alias));
+    proposeConfirmation(id, request);
+    return false;
+  }
+
+  if (normalized.startsWith("remove ") || normalized.startsWith("unbind ")) {
+    const int offset = normalized.startsWith("remove ") ? 7 : 7;
+    String alias = normalized.substring(offset);
+    alias.trim();
+    if (!validAliasInput(alias.c_str()) || !deviceRegistry.find(alias.c_str())) {
+      sendError(id, "device_not_found", "No registered device has that alias");
+      return false;
+    }
+    TaskRequest request;
+    request.operation = TaskOperation::DEVICE_UNBIND;
+    strlcpy(request.alias, alias.c_str(), sizeof(request.alias));
+    proposeConfirmation(id, request);
+    return false;
+  }
+
+  if (normalized.startsWith("rename ")) {
+    const int toPosition = normalized.indexOf(" to ");
+    if (toPosition < 0) {
+      sendError(id, "invalid_rename_prompt", "Expected: rename <alias> to <new alias>");
+      return false;
+    }
+    TaskRequest request;
+    request.operation = TaskOperation::DEVICE_RENAME;
+    String alias = normalized.substring(7, toPosition);
+    String newAlias = normalized.substring(toPosition + 4);
+    alias.trim();
+    newAlias.trim();
+    if (!validAliasInput(alias.c_str()) || !deviceRegistry.find(alias.c_str()) ||
+        !validAliasInput(newAlias.c_str())) {
+      sendError(id, "invalid_alias", "Existing and new aliases must be valid; existing alias must be registered");
+      return false;
+    }
+    strlcpy(request.alias, alias.c_str(), sizeof(request.alias));
+    strlcpy(request.newAlias, newAlias.c_str(), sizeof(request.newAlias));
+    proposeConfirmation(id, request);
+    return false;
+  }
+
+  if (normalized == "list devices" || normalized == "show devices") {
+    sendDeviceList(id);
+    return true;
+  }
+
+  handled = false;
+  return false;
+}
+
+bool handleNamedDevicePrompt(const char *id, const String &prompt, const String &normalized,
+                             bool &handled) {
+  handled = false;
+  const DeviceBinding *candidates[MICRONEEDLE_MAX_DEVICES]{};
+  const char *names[MICRONEEDLE_MAX_DEVICES]{};
+  size_t candidateCount = 0;
+  for (size_t i = 0; i < MICRONEEDLE_MAX_DEVICES; ++i) {
+    const DeviceBinding *binding = deviceRegistry.bindingAt(i);
+    if (!binding || !binding->occupied) continue;
+    String name = binding->displayName;
+    String aliasWords = binding->alias;
+    if (!containsAliasWords(normalized, name) && !containsAliasWords(normalized, aliasWords)) continue;
+    candidates[candidateCount] = binding;
+    names[candidateCount] = binding->displayName;
+    ++candidateCount;
+  }
+  if (!candidateCount) return false;
+  handled = true;
+
+  TaskRequest request;
+  request.priority = TaskPriority::INTERACTIVE;
+  float confidence = 1.0f;
+  const DeviceBinding *target = candidates[0];
+  if (tinyDecide.ready()) {
+    DeviceRouteResult route = tinyDecide.routeDevice(prompt, names, candidateCount);
+    if (route.action == DeviceRouteResult::ERROR || route.action == DeviceRouteResult::UNSUPPORTED ||
+        route.targetIndex < 0 || static_cast<size_t>(route.targetIndex) >= candidateCount) {
+      sendError(id, route.error ? route.error : "unsupported_device_prompt",
+                "Could not confidently route the named-device request");
+      return false;
+    }
+    target = candidates[route.targetIndex];
+    confidence = min(route.confidence, route.targetConfidence);
+    if (route.action == DeviceRouteResult::SET_ON) {
+      request.operation = TaskOperation::DEVICE_SET;
+      request.state = true;
+    } else if (route.action == DeviceRouteResult::SET_OFF) {
+      request.operation = TaskOperation::DEVICE_SET;
+      request.state = false;
+    } else {
+      request.operation = TaskOperation::DEVICE_GET;
+    }
+  } else {
+    if (normalized.indexOf("turn on") >= 0 || normalized.indexOf("switch on") >= 0) {
+      request.operation = TaskOperation::DEVICE_SET;
+      request.state = true;
+    } else if (normalized.indexOf("turn off") >= 0 || normalized.indexOf("switch off") >= 0) {
+      request.operation = TaskOperation::DEVICE_SET;
+      request.state = false;
+    } else if (normalized.indexOf("state") >= 0 || normalized.indexOf("status") >= 0) {
+      request.operation = TaskOperation::DEVICE_GET;
+    } else {
+      sendError(id, "unsupported_device_prompt", "No supported device operation was found");
+      return false;
+    }
+  }
+  strlcpy(request.alias, target->alias, sizeof(request.alias));
+  return submitTask(id, request, tinyDecide.ready() ? tinyDecide.name() : "deterministic-device-router",
+                    confidence);
+}
+
 bool handlePrompt(const char *id, String prompt) {
   String normalized = prompt;
   normalized.trim();
   normalized.toLowerCase();
+
+  bool handled = false;
+  const bool configurationResult = handleConfigurationPrompt(id, normalized, handled);
+  if (handled) return configurationResult;
+  const bool deviceResult = handleNamedDevicePrompt(id, prompt, normalized, handled);
+  if (handled) return deviceResult;
 
   if (tinyDecide.ready()) {
     TinyDecideResult decision = tinyDecide.interpret(prompt);
@@ -236,6 +588,171 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
   JsonObject args = request["args"].as<JsonObject>();
   if (strcmp(tool, "device.info") == 0) { sendInfo(id, false); return; }
   if (strcmp(tool, "device.capabilities") == 0) { sendInfo(id, true); return; }
+  if (strcmp(tool, "device.list") == 0) { sendDeviceList(id); return; }
+  if (strcmp(tool, "device.describe") == 0) {
+    if (!args["alias"].is<const char *>()) sendError(id, "invalid_args", "alias is required");
+    else sendDeviceDescription(id, args["alias"].as<const char *>());
+    return;
+  }
+
+  if (strcmp(tool, "confirmation.confirm") == 0) {
+    if (!args["confirmation_id"].is<uint32_t>()) {
+      sendError(id, "invalid_args", "confirmation_id is required");
+      return;
+    }
+    TaskRequest pending;
+    const char *error = nullptr;
+    if (!confirmations.confirm(args["confirmation_id"].as<uint32_t>(), pending, &error)) {
+      sendError(id, error, "Confirmation is missing or expired");
+      return;
+    }
+    submitTask(id, pending);
+    return;
+  }
+
+  if (strcmp(tool, "device.bind") == 0) {
+    if (!args["alias"].is<const char *>() || !args["pin"].is<int>()) {
+      sendError(id, "invalid_args", "device.bind requires alias and pin");
+      return;
+    }
+    const char *alias = args["alias"].as<const char *>();
+    const int pin = args["pin"].as<int>();
+    if (!validAliasInput(alias)) {
+      sendError(id, "invalid_alias", "Alias must be 1-31 letters, digits, spaces, dashes, or underscores");
+      return;
+    }
+    if (pin < 0 || pin > 48) {
+      sendError(id, "invalid_args", "pin must be a valid ESP32-S3 GPIO from 0 to 48");
+      return;
+    }
+    const char *pinReason = nullptr;
+    if (!BoardProfile::canBindOutput(static_cast<uint8_t>(pin), &pinReason) ||
+        deviceRegistry.pinClaimed(static_cast<uint8_t>(pin))) {
+      sendError(id, "unsafe_or_claimed_pin", pinReason ? pinReason : "Pin is already claimed");
+      return;
+    }
+    TaskRequest task;
+    task.operation = TaskOperation::DEVICE_BIND;
+    task.pin = static_cast<uint8_t>(pin);
+    strlcpy(task.alias, alias, sizeof(task.alias));
+    const char *activeLevel = args["active_level"] | "high";
+    const char *startupState = args["startup_state"] | "off";
+    if ((strcmp(activeLevel, "high") != 0 && strcmp(activeLevel, "low") != 0) ||
+        (strcmp(startupState, "on") != 0 && strcmp(startupState, "off") != 0)) {
+      sendError(id, "invalid_args", "active_level must be high/low and startup_state must be on/off");
+      return;
+    }
+    task.activeHigh = strcmp(activeLevel, "high") == 0;
+    task.startupOn = strcmp(startupState, "on") == 0;
+    proposeConfirmation(id, task);
+    return;
+  }
+
+  if (strcmp(tool, "device.unbind") == 0 || strcmp(tool, "device.rename") == 0) {
+    if (!args["alias"].is<const char *>()) {
+      sendError(id, "invalid_args", "alias is required");
+      return;
+    }
+    const char *alias = args["alias"].as<const char *>();
+    if (!validAliasInput(alias) || !deviceRegistry.find(alias)) {
+      sendError(id, "device_not_found", "No registered device has that alias");
+      return;
+    }
+    TaskRequest task;
+    task.operation = strcmp(tool, "device.unbind") == 0 ?
+                     TaskOperation::DEVICE_UNBIND : TaskOperation::DEVICE_RENAME;
+    strlcpy(task.alias, alias, sizeof(task.alias));
+    if (task.operation == TaskOperation::DEVICE_RENAME) {
+      if (!args["new_alias"].is<const char *>()) {
+        sendError(id, "invalid_args", "new_alias is required");
+        return;
+      }
+      const char *newAlias = args["new_alias"].as<const char *>();
+      if (!validAliasInput(newAlias)) {
+        sendError(id, "invalid_alias", "new_alias must be 1-31 valid characters");
+        return;
+      }
+      strlcpy(task.newAlias, newAlias, sizeof(task.newAlias));
+    }
+    proposeConfirmation(id, task);
+    return;
+  }
+
+  if (strcmp(tool, "device.set") == 0 || strcmp(tool, "device.get") == 0) {
+    if (!args["alias"].is<const char *>()) {
+      sendError(id, "invalid_args", "alias is required");
+      return;
+    }
+    const char *alias = args["alias"].as<const char *>();
+    if (!validAliasInput(alias) || !deviceRegistry.find(alias)) {
+      sendError(id, "device_not_found", "No registered device has that alias");
+      return;
+    }
+    TaskRequest task;
+    task.operation = strcmp(tool, "device.set") == 0 ?
+                     TaskOperation::DEVICE_SET : TaskOperation::DEVICE_GET;
+    strlcpy(task.alias, alias, sizeof(task.alias));
+    if (task.operation == TaskOperation::DEVICE_SET) {
+      if (args["state"].is<bool>()) task.state = args["state"].as<bool>();
+      else if (args["state"].is<const char *>()) {
+        const char *state = args["state"].as<const char *>();
+        if (strcmp(state, "on") == 0) task.state = true;
+        else if (strcmp(state, "off") == 0) task.state = false;
+        else {
+          sendError(id, "invalid_args", "state must be on, off, true, or false");
+          return;
+        }
+      } else {
+        sendError(id, "invalid_args", "device.set requires state");
+        return;
+      }
+    }
+    submitTask(id, task);
+    return;
+  }
+
+  if (strcmp(tool, "task.status") == 0) {
+    if (!args["task_id"].is<uint32_t>()) {
+      sendError(id, "invalid_args", "task_id is required");
+      return;
+    }
+    const TaskRecord *task = taskExecutor.find(args["task_id"].as<uint32_t>());
+    if (!task) sendError(id, "task_not_found", "Task does not exist");
+    else sendTaskRecord(id, *task);
+    return;
+  }
+
+  if (strcmp(tool, "task.cancel") == 0) {
+    if (!args["task_id"].is<uint32_t>()) {
+      sendError(id, "invalid_args", "task_id is required");
+      return;
+    }
+    const char *error = nullptr;
+    if (!taskExecutor.cancel(args["task_id"].as<uint32_t>(), &error))
+      sendError(id, error, "Task could not be cancelled");
+    else sendSuccess(id);
+    return;
+  }
+
+  if (strcmp(tool, "task.list") == 0) {
+    JsonDocument response;
+    response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
+    response["id"] = id;
+    response["success"] = true;
+    JsonArray tasks = response["result"]["tasks"].to<JsonArray>();
+    for (size_t i = 0; i < MICRONEEDLE_MAX_TASKS; ++i) {
+      const TaskRecord *task = taskExecutor.taskAt(i);
+      if (!task || task->status == TaskStatus::FREE) continue;
+      JsonObject item = tasks.add<JsonObject>();
+      item["id"] = task->id;
+      item["tool"] = TaskExecutor::operationName(task->request.operation);
+      item["status"] = TaskExecutor::statusName(task->status);
+    }
+    serializeJson(response, Serial);
+    Serial.println();
+    return;
+  }
+
   if (strcmp(tool, "led.off") == 0) {
     validateAndSetLed(0, 0, 0, 0);
     sendSuccess(id);
@@ -304,6 +821,9 @@ void setup() {
   pixel.show();
   setStatus(0, 0, 80);
   Serial.println("MicroNeedle ESP32-S3 starting");
+  deviceRegistry.begin();
+  taskExecutor.begin();
+  Serial.printf("Device registry: %u binding(s) loaded\n", static_cast<unsigned>(deviceRegistry.count()));
   if (tinyDecide.begin()) {
     Serial.println("Model backend: TinyDecide 10.4M Q4");
   } else {
@@ -311,7 +831,11 @@ void setup() {
   }
   Serial.println("Send plain text prompts or versioned JSON lines.");
 
-#if defined(MICRONEEDLE_WIFI_SSID) && defined(MICRONEEDLE_WIFI_PASSWORD)
+#if defined(MICRONEEDLE_WIFI_SSID) && defined(MICRONEEDLE_WIFI_PASSWORD) && \
+    defined(MICRONEEDLE_EXPERIMENTAL_HTTP_PROMPT)
+  // Experimental only: these handlers run on the AsyncWebServer task. Keep
+  // disabled until requests/responses are moved through the bounded owner-loop
+  // ingress queue, so model inference, NVS, Serial, and GPIO remain single-owner.
   WiFi.mode(WIFI_STA);
   WiFi.begin(MICRONEEDLE_WIFI_SSID, MICRONEEDLE_WIFI_PASSWORD);
   Serial.print("Connecting to Wi-Fi");
@@ -374,6 +898,14 @@ void loop() {
     } else if (line.length() <= MICRONEEDLE_MAX_INPUT) {
       line += c;
     }
+  }
+
+  taskExecutor.tick();
+  TaskRecord event;
+  while (taskExecutor.takeEvent(event)) {
+    sendTaskRecord(nullptr, event, true);
+    if (event.status == TaskStatus::COMPLETED) setStatus(0, 80, 0);
+    else setStatus(80, 0, 0);
   }
   delay(2);
 }

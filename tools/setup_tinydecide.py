@@ -15,7 +15,7 @@ DEPENDENCY = ROOT / ".deps" / "TinyDecide"
 MODEL_DIR = ROOT / ".models"
 MODEL = MODEL_DIR / "model.bin"
 IMAGE = MODEL_DIR / "tinydecide-esp32.bin"
-VOCAB = DEPENDENCY / "esp32" / "tinydecide" / "model" / "vocab.bin"
+VOCAB = MODEL_DIR / "vocab.bin"
 
 
 def run(*args: str) -> None:
@@ -37,12 +37,22 @@ def fetch_engine() -> None:
 
 def fetch_model() -> None:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    url = f"{REPOSITORY}/resolve/{REVISION}/model.bin?download=true"
-    if not MODEL.exists():
-        print(f"Downloading {url}")
-        urllib.request.urlretrieve(url, MODEL)
+    assets = {
+        MODEL: f"{REPOSITORY}/resolve/{REVISION}/model.bin?download=true",
+        VOCAB: f"{REPOSITORY}/resolve/{REVISION}/esp32/tinydecide/model/vocab.bin?download=true",
+    }
+    for path, url in assets.items():
+        if not path.exists():
+            print(f"Downloading {url}")
+            urllib.request.urlretrieve(url, path)
     if MODEL.stat().st_size < 6_000_000:
         raise RuntimeError(f"Downloaded model is unexpectedly small: {MODEL.stat().st_size} bytes")
+    vocab = VOCAB.read_bytes()
+    if len(vocab) < 100_000 or not vocab.startswith(b"TDV1"):
+        raise RuntimeError(
+            "Downloaded vocabulary is invalid (a Git LFS pointer was previously packed); "
+            "delete .models/vocab.bin and rerun setup"
+        )
 
 
 def pack_image() -> None:

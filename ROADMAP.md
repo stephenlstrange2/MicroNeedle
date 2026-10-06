@@ -386,6 +386,22 @@ The command `turn on garage light` remains unchanged. Candidate transports inclu
 11. PWM, digital input, and sensor drivers
 12. Remote-node capability and transport support
 
+### Current implementation status
+
+Implemented in firmware v0.2.0:
+
+- Conservative N16R8 pin safety profile
+- 16-entry persistent named GPIO-output registry in NVS
+- Active-high/active-low behavior and safe startup state
+- `device.bind`, `unbind`, `rename`, `list`, `describe`, `get`, and `set`
+- Four-entry random, one-time, expiring confirmation table
+- 16-slot weighted-priority task executor with retained completion records
+- Task status/list/cancel and structured terminal events
+- TinyDecide alias/operation routing with deterministic explicit-alias grounding
+- N-gram/deterministic recovery behavior
+
+Serial is the supported configuration transport for this milestone. HTTP prompt handling remains experimental and disabled by default pending a bounded ingress queue and transport-specific response sink.
+
 ### First acceptance milestone
 
 The first end-to-end milestone supports:

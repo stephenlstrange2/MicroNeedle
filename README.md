@@ -38,13 +38,13 @@ source ~/.venvs/platformio/bin/activate
 python -m pip install --upgrade pip platformio
 ```
 
-Fetch the pinned TinyDecide engine and create the 6.2 MB flash image:
+Fetch the pinned TinyDecide engine, the real Git-LFS model and vocabulary assets, and create the 6.4 MB flash image:
 
 ```sh
 python3 tools/setup_tinydecide.py
 ```
 
-The downloaded source and model are stored in ignored `.deps/` and `.models/` directories. The setup script pins the exact upstream revision used by the firmware.
+The downloaded source and model are stored in ignored `.deps/` and `.models/` directories. The setup script pins the exact upstream revision used by the firmware and validates that `vocab.bin` starts with `TDV1`; this prevents accidentally packing the repository's Git-LFS pointer file.
 
 ## Build and flash
 
@@ -79,9 +79,58 @@ If it reports `ngram fallback`, verify the model image was flashed at the correc
 
 The RGB pin defaults to GPIO 48. Override `KM_RGB_PIN` in [`platformio.ini`](platformio.ini) for boards using GPIO 38 or another pin.
 
+## Named devices and tasks
+
+MicroNeedle can persistently bind a safe GPIO output to a semantic alias. Configuration changes require confirmation:
+
+```text
+bind GPIO 4 as desk lamp
+```
+
+The response contains a confirmation ID and an exact `confirmation_prompt`:
+
+```json
+{"success":false,"requires_confirmation":true,"confirmation_id":3438707108,"confirmation_prompt":"confirm 3438707108","expires_in_seconds":30,"proposed":{"tool":"device.bind"}}
+```
+
+You must send that second command within 30 seconds; the proposal alone does not modify hardware:
+
+```text
+confirm 3438707108
+```
+
+The binding is queued, executed, saved to NVS, and reported through a completion event. It survives reboot. You can then use natural language:
+
+```text
+turn on desk lamp
+get desk lamp state
+turn off desk lamp
+list devices
+rename desk lamp to work light
+remove work light
+```
+
+Rename, removal, and binding operations require confirmation. TinyDecide routes control/query prompts to aliases; a deterministic device router is used if TinyDecide is unavailable.
+
+Equivalent JSON tools include:
+
+```json
+{"v":1,"id":"b1","tool":"device.bind","args":{"alias":"desk lamp","pin":4}}
+{"v":1,"id":"c1","tool":"confirmation.confirm","args":{"confirmation_id":1}}
+{"v":1,"id":"s1","tool":"device.set","args":{"alias":"desk lamp","state":"on"}}
+{"v":1,"id":"g1","tool":"device.get","args":{"alias":"desk lamp"}}
+{"v":1,"id":"l1","tool":"device.list","args":{}}
+```
+
+All device operations run through a 16-slot bounded priority executor. Requests first receive a queued task ID and later produce `task.completed`, `task.failed`, `task.cancelled`, or `task.timed_out` events. Inspect and cancel tasks with `task.status`, `task.list`, and `task.cancel`.
+
+The N16R8 board profile conservatively rejects boot-strapping, USB, JTAG/debug, console, flash/PSRAM, and both known onboard WS2812B pins (GPIO 38/48). Never connect a mains-powered lamp directly to a GPIO; use a correctly rated and isolated relay or driver circuit.
+
+Confirmation tokens are random, one-time, expire after 30 seconds, and occupy a bounded four-entry table. A request field such as `"confirmed": true` is intentionally ignored and cannot bypass confirmation.
+
 ## Optional Wi-Fi
 
-If `MICRONEEDLE_WIFI_SSID` and `MICRONEEDLE_WIFI_PASSWORD` are defined in `build_flags`, firmware exposes:
+The HTTP prompt path is currently experimental and disabled by default while it is moved behind a bounded single-owner ingress queue. To compile the existing prototype, define `MICRONEEDLE_WIFI_SSID`, `MICRONEEDLE_WIFI_PASSWORD`, and `MICRONEEDLE_EXPERIMENTAL_HTTP_PROMPT` in `build_flags`. It exposes:
 
 ```text
 GET /health
@@ -89,7 +138,7 @@ GET /prompt?text=turn%20the%20LED%20orange
 POST /prompt  {"prompt":"turn the LED orange"}
 ```
 
-Serial remains available if Wi-Fi is not configured or cannot connect.
+Serial is the supported control transport for named-device configuration in this milestone. The experimental HTTP handlers return only generic HTTP results and may not receive full structured task/confirmation responses; do not expose them to untrusted networks.
 
 ## Flash layout
 
