@@ -61,19 +61,17 @@ The engine validates ranges, rejects unknown tools, limits input size, and retur
 
 The first prompt interface is serial JSON-lines and plain-text serial prompts. An optional Wi-Fi HTTP interface is enabled at compile time with credentials and accepts `GET /prompt?text=...`; serial remains the fallback. A future JSON `POST /prompt` endpoint will share the same backend.
 
-The initial prompt backend is deterministic and intentionally narrow. It handles phrases such as `red`, `green`, `blue`, `orange`, `white`, `off`, and `set brightness to N`. The backend interface is replaceable by an on-device model or a remote model service.
+The primary prompt backend is now TinyDecide, a 10.4M-parameter 4-bit zero-shot decision model running locally on the ESP32-S3. It selects actions and colors and extracts brightness in a single encoder pass. The earlier n-gram classifier remains the recovery backend when the model partition is unavailable.
 
-### 5. On-device model track (current next phase)
+### 5. On-device model track (implemented, hardware validation next)
 
-The first real AI target is the ESP32-S3 itself. We will start with a tiny intent classifier, not a general chat model:
+1. A dedicated flash partition holds TinyDecide's 6.2 MB model and vocabulary.
+2. The ESP32-S3 PIE vector kernel uses both cores; inference scratch allocations prefer PSRAM.
+3. The backend reports probability, decision confidence, latency, tokens, and truncation.
+4. Model results are translated into the versioned tool contract and validated before execution.
+5. Unsupported or ungrounded choices are rejected; runtime initialization failures use the small fallback model.
 
-1. Define a fixed intent set (`led.set`, `led.off`, unsupported) and slot fields (`color`, `brightness`).
-2. Create a small labeled prompt dataset and a host-side training/evaluation script.
-3. Benchmark a compact quantized runtime on the N16R8, keeping the model and tensor arena in PSRAM where possible.
-4. Add confidence thresholds: high-confidence commands execute, uncertain commands require confirmation, and unsupported prompts are refused.
-5. Keep the deterministic parser as a fallback and test both backends against the same command validator.
-
-The first model is expected to be a classifier/slot extractor rather than an unrestricted language model. The recommended ESP32-S3 prototype is a tiny hashed character n-gram classifier with int8 weights exported as a C header; it avoids a heavyweight tokenizer/runtime and handles small spelling variations. TensorFlow Lite Micro or ESP-DL can be evaluated later if the model grows. A real Needle-sized generative model is a later ESP32-P4/Luckfox target.
+The next work is on-device accuracy/latency evaluation, threshold calibration, richer tool schemas, and correction prototypes. A generative Needle-style backend remains a later ESP32-P4/Luckfox target.
 
 ### 6. Model boundary
 
@@ -87,7 +85,7 @@ The first model is expected to be a classifier/slot extractor rather than an unr
 
 Every backend emits the same command envelope and remains subject to firmware validation.
 
-### 6. Additional transports and devices
+### 7. Additional transports and devices
 
 After serial stability: HTTP, WebSocket/MQTT, BLE, GPIO, sensors, relays, and displays. Transport and hardware implementations must not alter the command protocol.
 

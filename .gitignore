@@ -1,7 +1,16 @@
-# PlatformIO
+# PlatformIO and generated dependency/model caches
 .pio/
 .piolibdeps/
 .cache/
+.deps/
+.models/
+.sconsign*.dblite
+compile_commands.json
+
+# ESP-IDF generated state (for future IDF environments)
+sdkconfig
+sdkconfig.old
+managed_components/
 
 # Build artifacts
 *.elf

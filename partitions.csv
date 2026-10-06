@@ -1,0 +1,6 @@
+# MicroNeedle ESP32-S3 N16R8: firmware, TinyDecide model, and future storage.
+# Name,       Type, SubType, Offset,    Size,      Flags
+nvs,          data, nvs,     0x9000,    0x5000,
+factory,      app,  factory, 0x10000,   0x300000,
+tinydecide,   data, 0x40,    0x310000,  0x660000,
+storage,      data, spiffs,  0x970000,  0x680000,

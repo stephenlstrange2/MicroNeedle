@@ -5,6 +5,7 @@
 #include <ESPAsyncWebServer.h>
 #include "model_backend.h"
 #include "intent_classifier.h"
+#include "tinydecide_backend.h"
 
 #ifndef KM_RGB_PIN
 #define KM_RGB_PIN 48
@@ -20,6 +21,7 @@ static constexpr uint16_t LED_COUNT = 1;
 Adafruit_NeoPixel pixel(LED_COUNT, KM_RGB_PIN, NEO_GRB + NEO_KHZ800);
 AsyncWebServer webServer(80);
 IntentClassifier intentClassifier;
+TinyDecideBackend tinyDecide;
 
 struct RgbValue {
   uint8_t r;
@@ -71,6 +73,42 @@ void sendPromptResponse(const char *id, const IntentPrediction &prediction,
   Serial.println();
 }
 
+void sendTinyDecideResponse(const char *id, const TinyDecideResult &decision,
+                            bool success, const char *errorCode = nullptr,
+                            const char *errorMessage = nullptr) {
+  JsonDocument response;
+  response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
+  response["id"] = id ? id : "";
+  response["success"] = success;
+  JsonObject result = response["result"].to<JsonObject>();
+  result["backend"] = tinyDecide.name();
+  result["confidence"] = decision.confidence;
+  result["decision_confidence"] = decision.decisionConfidence;
+  result["latency_ms"] = decision.elapsedMs;
+  result["tokens"] = decision.tokens;
+  result["truncated"] = decision.truncated;
+  switch (decision.action) {
+    case TinyDecideResult::SET_LED: result["intent"] = "led.set"; break;
+    case TinyDecideResult::LED_OFF: result["intent"] = "led.off"; break;
+    case TinyDecideResult::UNSUPPORTED: result["intent"] = "unsupported"; break;
+    default: result["intent"] = "error"; break;
+  }
+  if (decision.action == TinyDecideResult::SET_LED) {
+    result["color_confidence"] = decision.colorConfidence;
+    JsonObject args = result["args"].to<JsonObject>();
+    args["r"] = decision.r;
+    args["g"] = decision.g;
+    args["b"] = decision.b;
+    args["brightness"] = decision.brightness;
+  }
+  if (!success) {
+    response["error"]["code"] = errorCode;
+    response["error"]["message"] = errorMessage;
+  }
+  serializeJson(response, Serial);
+  Serial.println();
+}
+
 void sendInfo(const char *id, bool capabilities) {
   JsonDocument response;
   response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
@@ -85,6 +123,7 @@ void sendInfo(const char *id, bool capabilities) {
   result["heap_free"] = ESP.getFreeHeap();
   result["psram_bytes"] = ESP.getPsramSize();
   result["psram_free"] = ESP.getFreePsram();
+  result["model_backend"] = tinyDecide.ready() ? tinyDecide.name() : "ngram-fallback";
   if (capabilities) {
     JsonArray tools = result["tools"].to<JsonArray>();
     tools.add("device.info");
@@ -123,20 +162,52 @@ uint8_t parseBrightness(String text, uint8_t fallback) {
   return static_cast<uint8_t>(constrain(number.toInt(), 0, 255));
 }
 
+bool validateAndSetLed(int r, int g, int b, int brightness) {
+  if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255 ||
+      brightness < 0 || brightness > 255) {
+    return false;
+  }
+  setStatus(static_cast<uint8_t>(r), static_cast<uint8_t>(g),
+            static_cast<uint8_t>(b), static_cast<uint8_t>(brightness));
+  return true;
+}
+
 bool handlePrompt(const char *id, String prompt) {
   String normalized = prompt;
   normalized.trim();
   normalized.toLowerCase();
 
-  // The tiny on-device classifier gates prompt intent. Slot extraction remains
-  // deterministic for now; both paths still terminate in the tool validator.
+  if (tinyDecide.ready()) {
+    TinyDecideResult decision = tinyDecide.interpret(prompt);
+    if (decision.action == TinyDecideResult::LED_OFF) {
+      validateAndSetLed(0, 0, 0, 0);
+      sendTinyDecideResponse(id, decision, true);
+      return true;
+    }
+    if (decision.action == TinyDecideResult::SET_LED) {
+      if (!validateAndSetLed(decision.r, decision.g, decision.b, decision.brightness)) {
+        sendTinyDecideResponse(id, decision, false, "invalid_model_output",
+                               "Model output failed command validation");
+        return false;
+      }
+      sendTinyDecideResponse(id, decision, true);
+      return true;
+    }
+    if (decision.action == TinyDecideResult::UNSUPPORTED) {
+      sendTinyDecideResponse(id, decision, false, "unsupported_prompt",
+                             decision.error ? decision.error : "TinyDecide rejected the prompt");
+      return false;
+    }
+    // Runtime failures fall through to the small local classifier.
+  }
+
   IntentPrediction prediction = intentClassifier.predict(normalized);
   if (strcmp(prediction.label, "unsupported") == 0 || prediction.confidence < 0.60f) {
     sendPromptResponse(id, prediction, false, "low_confidence", "Prompt intent was not recognized confidently");
     return false;
   }
   if (strcmp(prediction.label, "led.off") == 0 || normalized.indexOf("off") >= 0 || normalized.indexOf("disable") >= 0) {
-    setStatus(0, 0, 0, 0);
+    validateAndSetLed(0, 0, 0, 0);
     sendPromptResponse(id, prediction, true);
     return true;
   }
@@ -148,7 +219,7 @@ bool handlePrompt(const char *id, String prompt) {
   }
 
   uint8_t brightness = parseBrightness(normalized, 80);
-  setStatus(color.r, color.g, color.b, brightness);
+  validateAndSetLed(color.r, color.g, color.b, brightness);
   sendPromptResponse(id, prediction, true);
   return true;
 }
@@ -166,7 +237,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
   if (strcmp(tool, "device.info") == 0) { sendInfo(id, false); return; }
   if (strcmp(tool, "device.capabilities") == 0) { sendInfo(id, true); return; }
   if (strcmp(tool, "led.off") == 0) {
-    setStatus(0, 0, 0, 0);
+    validateAndSetLed(0, 0, 0, 0);
     sendSuccess(id);
     return;
   }
@@ -180,7 +251,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
       sendError(id, "invalid_args", "brightness must be from 0 to 255");
       return;
     }
-    setStatus(r, g, b, brightness);
+    validateAndSetLed(r, g, b, brightness);
     sendSuccess(id);
     return;
   }
@@ -232,7 +303,12 @@ void setup() {
   pixel.clear();
   pixel.show();
   setStatus(0, 0, 80);
-  Serial.println("MicroNeedle ESP32-S3 ready");
+  Serial.println("MicroNeedle ESP32-S3 starting");
+  if (tinyDecide.begin()) {
+    Serial.println("Model backend: TinyDecide 10.4M Q4");
+  } else {
+    Serial.println("Model backend: n-gram fallback (TinyDecide partition unavailable)");
+  }
   Serial.println("Send plain text prompts or versioned JSON lines.");
 
 #if defined(MICRONEEDLE_WIFI_SSID) && defined(MICRONEEDLE_WIFI_PASSWORD)
