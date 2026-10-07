@@ -493,6 +493,8 @@ Acceptance:
 - HTTP receives the same structured response as serial.
 - Slow inference does not block health checks or task processing.
 
+Implementation status (2026-10-06): implemented in source and compile-verified with both default and Wi-Fi-enabled build flags. Serial/HTTP share a bounded owner-loop ingress queue, structured responses use transport sinks, TinyDecide runs on a serialized worker, HTTP bodies accumulate safely, task events stream over SSE, and confirmations bind to session plus operation digest. Concurrent on-device HTTP/serial acceptance remains pending; see `EVIDENCE.md`.
+
 ### Milestone D — Cooperative task lifecycle
 
 Evolve the synchronous executor into the planned cooperative runtime:

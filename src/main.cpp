@@ -10,6 +10,9 @@
 #include "confirmation_manager.h"
 #include "command_validator.h"
 #include "tool_registry.h"
+#include "ingress_queue.h"
+#include "response_sink.h"
+#include "inference_worker.h"
 
 #ifndef KM_RGB_PIN
 #define KM_RGB_PIN 48
@@ -21,8 +24,12 @@
 
 static constexpr size_t MICRONEEDLE_MAX_INPUT = 768;
 AsyncWebServer webServer(80);
+AsyncEventSource taskEvents("/events");
+IngressQueue ingressQueue;
+SerialResponseSink serialResponseSink;
 IntentClassifier intentClassifier;
 TinyDecideBackend tinyDecide;
+InferenceWorker inferenceWorker(tinyDecide);
 DeviceRegistry deviceRegistry;
 TaskExecutor taskExecutor(deviceRegistry);
 ConfirmationManager confirmations;
@@ -32,6 +39,19 @@ struct RgbValue {
   uint8_t g;
   uint8_t b;
 };
+
+struct PendingInference {
+  bool active = false;
+  uint32_t jobId = 0;
+  IngressRequest ingress{};
+  char requestId[48] = {};
+  char prompt[MICRONEEDLE_INGRESS_PAYLOAD_SIZE] = {};
+};
+
+PendingInference pendingInference[MICRONEEDLE_INFERENCE_CAPACITY]{};
+IngressRequest *activeIngress = nullptr;
+uint32_t nextInferenceId = 1;
+bool inferenceReady = false;
 
 const char *driverName(DriverType driver) {
   return driver == DriverType::WS2812_RGB ? "ws2812.rgb" : "gpio.output";
@@ -54,8 +74,7 @@ void sendError(const char *id, const char *code, const char *message) {
   response["success"] = false;
   response["error"]["code"] = code;
   response["error"]["message"] = message;
-  serializeJson(response, Serial);
-  Serial.println();
+  emitResponse(response, 422);
 }
 
 void sendSuccess(const char *id) {
@@ -63,8 +82,7 @@ void sendSuccess(const char *id) {
   response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
   response["id"] = id ? id : "";
   response["success"] = true;
-  serializeJson(response, Serial);
-  Serial.println();
+  emitResponse(response);
 }
 
 void sendTaskAccepted(const char *id, uint32_t taskId, const char *tool,
@@ -83,8 +101,7 @@ void sendTaskAccepted(const char *id, uint32_t taskId, const char *tool,
     routing["mode"] = strstr(backend, "tinydecide") ? "model" : "deterministic";
     if (confidence >= 0.0f) routing["confidence"] = confidence;
   }
-  serializeJson(response, Serial);
-  Serial.println();
+  emitResponse(response);
 }
 
 void sendConfirmation(const char *id, uint32_t confirmationId, const TaskRequest &proposal) {
@@ -96,6 +113,7 @@ void sendConfirmation(const char *id, uint32_t confirmationId, const TaskRequest
   response["confirmation_id"] = confirmationId;
   response["confirmation_prompt"] = String("confirm ") + confirmationId;
   response["expires_in_seconds"] = 30;
+  response["confirmation_session"] = currentSessionId();
   JsonObject proposed = response["proposed"].to<JsonObject>();
   proposed["tool"] = TaskExecutor::operationName(proposal.operation);
   JsonObject args = proposed["args"].to<JsonObject>();
@@ -108,8 +126,7 @@ void sendConfirmation(const char *id, uint32_t confirmationId, const TaskRequest
   } else if (proposal.operation == TaskOperation::DEVICE_RENAME) {
     args["new_alias"] = proposal.newAlias;
   }
-  serializeJson(response, Serial);
-  Serial.println();
+  emitResponse(response);
 }
 
 bool proposeConfirmation(const char *id, const TaskRequest &request) {
@@ -119,7 +136,7 @@ bool proposeConfirmation(const char *id, const TaskRequest &request) {
               "Proposed configuration failed centralized validation");
     return false;
   }
-  const uint32_t confirmationId = confirmations.propose(request);
+  const uint32_t confirmationId = confirmations.propose(request, currentSessionId());
   if (!confirmationId) {
     sendError(id, "confirmation_capacity_full", "Too many pending confirmations");
     return false;
@@ -160,8 +177,7 @@ void sendDeviceList(const char *id) {
       device["active_level"] = binding->activeHigh ? "high" : "low";
     device["state"] = binding->currentOn ? "on" : "off";
   }
-  serializeJson(response, Serial);
-  Serial.println();
+  emitResponse(response);
 }
 
 void sendDeviceDescription(const char *id, const char *alias) {
@@ -201,8 +217,7 @@ void sendDeviceDescription(const char *id, const char *alias) {
   if (binding->capabilities & CAP_COLOR) capabilities.add("color");
   if (binding->capabilities & CAP_BRIGHTNESS) capabilities.add("brightness");
   if (binding->capabilities & CAP_PATTERN) capabilities.add("pattern");
-  serializeJson(response, Serial);
-  Serial.println();
+  emitResponse(response);
 }
 
 void sendTaskRecord(const char *id, const TaskRecord &record, bool event = false) {
@@ -235,8 +250,8 @@ void sendTaskRecord(const char *id, const TaskRecord &record, bool event = false
     }
   }
   if (record.error[0]) task["error"] = record.error;
-  serializeJson(response, Serial);
-  Serial.println();
+  if (event) emitEvent(response, &taskEvents);
+  else emitResponse(response);
 }
 
 void sendPromptResponse(const char *id, const IntentPrediction &prediction,
@@ -256,8 +271,7 @@ void sendPromptResponse(const char *id, const IntentPrediction &prediction,
     response["error"]["code"] = errorCode;
     response["error"]["message"] = errorMessage;
   }
-  serializeJson(response, Serial);
-  Serial.println();
+  emitResponse(response);
 }
 
 void sendTinyDecideResponse(const char *id, const TinyDecideResult &decision,
@@ -296,8 +310,7 @@ void sendTinyDecideResponse(const char *id, const TinyDecideResult &decision,
     response["error"]["code"] = errorCode;
     response["error"]["message"] = errorMessage;
   }
-  serializeJson(response, Serial);
-  Serial.println();
+  emitResponse(response);
 }
 
 void sendInfo(const char *id, bool capabilities) {
@@ -306,7 +319,7 @@ void sendInfo(const char *id, bool capabilities) {
   response["id"] = id ? id : "";
   response["success"] = true;
   JsonObject result = response["result"].to<JsonObject>();
-  result["firmware"] = "microneedle-0.3.0";
+  result["firmware"] = "microneedle-0.4.0";
   result["protocol"] = MICRONEEDLE_PROTOCOL_VERSION;
   result["chip"] = ESP.getChipModel();
   result["cpu_mhz"] = ESP.getCpuFreqMHz();
@@ -314,7 +327,7 @@ void sendInfo(const char *id, bool capabilities) {
   result["heap_free"] = ESP.getFreeHeap();
   result["psram_bytes"] = ESP.getPsramSize();
   result["psram_free"] = ESP.getFreePsram();
-  result["model_backend"] = tinyDecide.ready() ? tinyDecide.name() : "ngram-fallback";
+  result["model_backend"] = inferenceReady ? tinyDecide.name() : "ngram-fallback";
   if (capabilities) {
     JsonArray tools = result["tools"].to<JsonArray>();
     JsonArray schemas = result["tool_schemas"].to<JsonArray>();
@@ -346,9 +359,10 @@ void sendInfo(const char *id, bool capabilities) {
     result["board_profile"] = BoardProfile::name();
     result["device_count"] = deviceRegistry.visibleCount();
     result["task_capacity"] = MICRONEEDLE_MAX_TASKS;
+    result["ingress_capacity"] = MICRONEEDLE_INGRESS_CAPACITY;
+    result["inference_capacity"] = MICRONEEDLE_INFERENCE_CAPACITY;
   }
-  serializeJson(response, Serial);
-  Serial.println();
+  emitResponse(response);
 }
 
 bool hasWord(String text, const char *word) {
@@ -429,6 +443,70 @@ bool parseUnsignedAfter(const String &text, int start, uint32_t &value) {
   return number.length() > 0;
 }
 
+PendingInference *reserveInference(const char *id, const String &prompt, uint32_t &jobId) {
+  if (!activeIngress) return nullptr;
+  for (auto &pending : pendingInference) {
+    if (pending.active) continue;
+    pending = PendingInference{};
+    pending.active = true;
+    pending.jobId = nextInferenceId++;
+    if (!pending.jobId) pending.jobId = nextInferenceId++;
+    pending.ingress = *activeIngress;
+    strlcpy(pending.requestId, id ? id : "", sizeof(pending.requestId));
+    strlcpy(pending.prompt, prompt.c_str(), sizeof(pending.prompt));
+    jobId = pending.jobId;
+    return &pending;
+  }
+  return nullptr;
+}
+
+void releaseInference(uint32_t jobId) {
+  for (auto &pending : pendingInference)
+    if (pending.active && pending.jobId == jobId) pending = PendingInference{};
+}
+
+bool queueLedInference(const char *id, const String &prompt) {
+  uint32_t jobId = 0;
+  if (!reserveInference(id, prompt, jobId)) {
+    sendError(id, "inference_capacity_full", "Too many pending inference requests");
+    return false;
+  }
+  InferenceJob job;
+  job.id = jobId;
+  job.kind = InferenceKind::LED_INTENT;
+  strlcpy(job.prompt, prompt.c_str(), sizeof(job.prompt));
+  if (!inferenceWorker.submit(job)) {
+    releaseInference(jobId);
+    sendError(id, "inference_queue_full", "Inference request could not be queued");
+    return false;
+  }
+  return true;
+}
+
+bool queueDeviceInference(const char *id, const String &prompt,
+                          const DeviceBinding *const *candidates, size_t candidateCount) {
+  uint32_t jobId = 0;
+  if (!reserveInference(id, prompt, jobId)) {
+    sendError(id, "inference_capacity_full", "Too many pending inference requests");
+    return false;
+  }
+  InferenceJob job;
+  job.id = jobId;
+  job.kind = InferenceKind::DEVICE_ROUTE;
+  strlcpy(job.prompt, prompt.c_str(), sizeof(job.prompt));
+  job.candidateCount = static_cast<uint8_t>(min(candidateCount, MICRONEEDLE_INFERENCE_CANDIDATES));
+  for (uint8_t i = 0; i < job.candidateCount; ++i) {
+    strlcpy(job.candidateNames[i], candidates[i]->displayName, sizeof(job.candidateNames[i]));
+    strlcpy(job.candidateAliases[i], candidates[i]->alias, sizeof(job.candidateAliases[i]));
+  }
+  if (!inferenceWorker.submit(job)) {
+    releaseInference(jobId);
+    sendError(id, "inference_queue_full", "Inference request could not be queued");
+    return false;
+  }
+  return true;
+}
+
 bool handleConfigurationPrompt(const char *id, const String &normalized, bool &handled) {
   handled = true;
   if (normalized.startsWith("confirm ")) {
@@ -439,7 +517,7 @@ bool handleConfigurationPrompt(const char *id, const String &normalized, bool &h
     }
     TaskRequest request;
     const char *error = nullptr;
-    if (!confirmations.confirm(confirmationId, request, &error)) {
+    if (!confirmations.confirm(confirmationId, currentSessionId(), request, &error)) {
       sendError(id, error, "Confirmation is missing or expired");
       return false;
     }
@@ -545,7 +623,6 @@ bool handleNamedDevicePrompt(const char *id, const String &prompt, const String 
                              bool &handled) {
   handled = false;
   const DeviceBinding *candidates[DeviceRegistry::bindingSlots()]{};
-  const char *names[DeviceRegistry::bindingSlots()]{};
   size_t candidateCount = 0;
   for (size_t i = 0; i < DeviceRegistry::bindingSlots(); ++i) {
     const DeviceBinding *binding = deviceRegistry.bindingAt(i);
@@ -554,7 +631,6 @@ bool handleNamedDevicePrompt(const char *id, const String &prompt, const String 
     String aliasWords = binding->alias;
     if (!containsAliasWords(normalized, name) && !containsAliasWords(normalized, aliasWords)) continue;
     candidates[candidateCount] = binding;
-    names[candidateCount] = binding->displayName;
     ++candidateCount;
   }
 
@@ -583,7 +659,6 @@ bool handleNamedDevicePrompt(const char *id, const String &prompt, const String 
           if (containsAliasWords(aliasWords, word)) {
             if (!candidateCount) {
               candidates[0] = binding;
-              names[0] = binding->displayName;
               candidateCount = 1;
             } else if (candidates[0] != binding) {
               candidateCount = 2;  // mark ambiguous
@@ -619,7 +694,6 @@ bool handleNamedDevicePrompt(const char *id, const String &prompt, const String 
   TaskRequest request;
   request.priority = TaskPriority::INTERACTIVE;
   float confidence = 1.0f;
-  bool modelAssisted = false;
   const DeviceBinding *target = candidates[0];
 
   // Explicit, safely grounded command phrases do not need probabilistic
@@ -648,33 +722,14 @@ bool handleNamedDevicePrompt(const char *id, const String &prompt, const String 
       request.operation = TaskOperation::DEVICE_SET;
       request.state = explicitOn;
     }
-  } else if (tinyDecide.ready()) {
-    modelAssisted = true;
-    DeviceRouteResult route = tinyDecide.routeDevice(prompt, names, candidateCount);
-    if (route.action == DeviceRouteResult::ERROR || route.action == DeviceRouteResult::UNSUPPORTED ||
-        route.targetIndex < 0 || static_cast<size_t>(route.targetIndex) >= candidateCount) {
-      sendError(id, route.error ? route.error : "unsupported_device_prompt",
-                "Could not confidently route the named-device request");
-      return false;
-    }
-    target = candidates[route.targetIndex];
-    confidence = min(route.confidence, route.targetConfidence);
-    if (route.action == DeviceRouteResult::SET_ON) {
-      request.operation = TaskOperation::DEVICE_SET;
-      request.state = true;
-    } else if (route.action == DeviceRouteResult::SET_OFF) {
-      request.operation = TaskOperation::DEVICE_SET;
-      request.state = false;
-    } else {
-      request.operation = TaskOperation::DEVICE_GET;
-    }
+  } else if (inferenceReady) {
+    return queueDeviceInference(id, prompt, candidates, candidateCount);
   } else {
     sendError(id, "unsupported_device_prompt", "No supported device operation was found");
     return false;
   }
   strlcpy(request.alias, target->alias, sizeof(request.alias));
-  return submitTask(id, request, modelAssisted ? tinyDecide.name() : "deterministic-device-router",
-                    confidence);
+  return submitTask(id, request, "deterministic-device-router", confidence);
 }
 
 bool handleLedPrompt(const char *id, const String &normalized, bool &handled) {
@@ -727,6 +782,34 @@ bool handleLedPrompt(const char *id, const String &normalized, bool &handled) {
   return false;
 }
 
+bool handleFallbackPrompt(const char *id, String prompt) {
+  String normalized = prompt;
+  normalized.trim();
+  normalized.toLowerCase();
+  IntentPrediction prediction = intentClassifier.predict(normalized);
+  if (strcmp(prediction.label, "unsupported") == 0 || prediction.confidence < 0.60f) {
+    sendPromptResponse(id, prediction, false, "low_confidence",
+                       "Prompt intent was not recognized confidently");
+    return false;
+  }
+  if (strcmp(prediction.label, "led.off") == 0 || normalized.indexOf("off") >= 0 ||
+      normalized.indexOf("disable") >= 0) {
+    TaskRequest request;
+    request.operation = TaskOperation::DEVICE_SET;
+    strlcpy(request.alias, "status_led", sizeof(request.alias));
+    request.state = false;
+    return submitTask(id, request, "ngram-fallback", prediction.confidence);
+  }
+  RgbValue color;
+  if (!parseColor(normalized, color)) {
+    sendPromptResponse(id, prediction, false, "unsupported_prompt",
+                       "No supported LED color or action was found");
+    return false;
+  }
+  return submitLedColor(id, color.r, color.g, color.b, parseBrightness(normalized, 80),
+                        "ngram-fallback", prediction.confidence);
+}
+
 bool handlePrompt(const char *id, String prompt) {
   String normalized = prompt;
   normalized.trim();
@@ -740,49 +823,9 @@ bool handlePrompt(const char *id, String prompt) {
   const bool deviceResult = handleNamedDevicePrompt(id, prompt, normalized, handled);
   if (handled) return deviceResult;
 
-  if (tinyDecide.ready()) {
-    TinyDecideResult decision = tinyDecide.interpret(prompt);
-    if (decision.action == TinyDecideResult::LED_OFF) {
-      TaskRequest request;
-      request.operation = TaskOperation::DEVICE_SET;
-      strlcpy(request.alias, "status_led", sizeof(request.alias));
-      request.state = false;
-      return submitTask(id, request, tinyDecide.name(), decision.confidence);
-    }
-    if (decision.action == TinyDecideResult::SET_LED) {
-      return submitLedColor(id, decision.r, decision.g, decision.b, decision.brightness,
-                            tinyDecide.name(), decision.confidence);
-    }
-    if (decision.action == TinyDecideResult::UNSUPPORTED) {
-      sendTinyDecideResponse(id, decision, false, "unsupported_prompt",
-                             decision.error ? decision.error : "TinyDecide rejected the prompt");
-      return false;
-    }
-    // Runtime failures fall through to the small local classifier.
-  }
+  if (inferenceReady) return queueLedInference(id, prompt);
 
-  IntentPrediction prediction = intentClassifier.predict(normalized);
-  if (strcmp(prediction.label, "unsupported") == 0 || prediction.confidence < 0.60f) {
-    sendPromptResponse(id, prediction, false, "low_confidence", "Prompt intent was not recognized confidently");
-    return false;
-  }
-  if (strcmp(prediction.label, "led.off") == 0 || normalized.indexOf("off") >= 0 || normalized.indexOf("disable") >= 0) {
-    TaskRequest request;
-    request.operation = TaskOperation::DEVICE_SET;
-    strlcpy(request.alias, "status_led", sizeof(request.alias));
-    request.state = false;
-    return submitTask(id, request, "ngram-fallback", prediction.confidence);
-  }
-
-  RgbValue color;
-  if (!parseColor(normalized, color)) {
-    sendPromptResponse(id, prediction, false, "unsupported_prompt", "No supported LED color or action was found");
-    return false;
-  }
-
-  uint8_t brightness = parseBrightness(normalized, 80);
-  return submitLedColor(id, color.r, color.g, color.b, brightness,
-                        "ngram-fallback", prediction.confidence);
+  return handleFallbackPrompt(id, prompt);
 }
 
 bool getByte(JsonObject args, const char *key, uint8_t &value) {
@@ -828,7 +871,8 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
     }
     TaskRequest pending;
     const char *error = nullptr;
-    if (!confirmations.confirm(args["confirmation_id"].as<uint32_t>(), pending, &error)) {
+    if (!confirmations.confirm(args["confirmation_id"].as<uint32_t>(), currentSessionId(),
+                               pending, &error)) {
       sendError(id, error, "Confirmation is missing or expired");
       return;
     }
@@ -974,8 +1018,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
       item["tool"] = TaskExecutor::operationName(task->request.operation);
       item["status"] = TaskExecutor::statusName(task->status);
     }
-    serializeJson(response, Serial);
-    Serial.println();
+    emitResponse(response);
     return;
   }
 
@@ -1020,7 +1063,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
   sendError(id, "tool_dispatch_error", "Registered tool has no handler");
 }
 
-void handleLine(String line) {
+void handleLine(String line, const char *defaultId = "serial") {
   line.trim();
   if (!line.length()) return;
   if (line.length() > MICRONEEDLE_MAX_INPUT) {
@@ -1029,7 +1072,7 @@ void handleLine(String line) {
   }
 
   if (line[0] != '{') {
-    handlePrompt("serial", line);
+    handlePrompt(defaultId, line);
     return;
   }
 
@@ -1044,7 +1087,7 @@ void handleLine(String line) {
     return;
   }
 
-  const char *id = request["id"] | "serial";
+  const char *id = request["id"] | defaultId;
   if (request["prompt"].is<const char *>()) {
     handlePrompt(id, request["prompt"].as<String>());
     return;
@@ -1056,25 +1099,138 @@ void handleLine(String line) {
   sendError(id, "invalid_request", "Request requires prompt or tool");
 }
 
+void httpSessionId(AsyncWebServerRequest *request, char *output, size_t outputSize) {
+  if (request->hasHeader("X-MicroNeedle-Session")) {
+    strlcpy(output, request->getHeader("X-MicroNeedle-Session")->value().c_str(), outputSize);
+    return;
+  }
+  String remote = request->client()->remoteIP().toString();
+  snprintf(output, outputSize, "http:%s", remote.c_str());
+}
+
+bool enqueueHttp(AsyncWebServerRequest *request, const String &payload) {
+  if (payload.length() > MICRONEEDLE_MAX_INPUT) {
+    request->send(413, "application/json", "{\"success\":false,\"error\":{\"code\":\"input_too_large\"}}");
+    return false;
+  }
+  IngressRequest ingress;
+  ingress.origin = IngressOrigin::HTTP_REQUEST;
+  strlcpy(ingress.payload, payload.c_str(), sizeof(ingress.payload));
+  httpSessionId(request, ingress.session, sizeof(ingress.session));
+  ingress.httpRequest = request;
+  if (!ingressQueue.push(ingress)) {
+    request->send(503, "application/json", "{\"success\":false,\"error\":{\"code\":\"ingress_queue_full\"}}");
+    return false;
+  }
+  return true;
+}
+
+PendingInference *findPendingInference(uint32_t jobId) {
+  for (auto &pending : pendingInference)
+    if (pending.active && pending.jobId == jobId) return &pending;
+  return nullptr;
+}
+
+void processInferenceResults() {
+  InferenceResult result;
+  while (inferenceWorker.takeResult(result)) {
+    PendingInference *pending = findPendingInference(result.id);
+    if (!pending) continue;
+    HttpResponseSink httpSink(pending->ingress.httpRequest);
+    if (pending->ingress.origin == IngressOrigin::HTTP_REQUEST)
+      setResponseContext(&httpSink, pending->ingress.session);
+    else
+      setResponseContext(&serialResponseSink, pending->ingress.session);
+
+    if (result.kind == InferenceKind::DEVICE_ROUTE) {
+      DeviceRouteResult &route = result.device;
+      if (route.action == DeviceRouteResult::ERROR || route.action == DeviceRouteResult::UNSUPPORTED ||
+          route.targetIndex < 0 || route.targetIndex >= result.candidateCount) {
+        sendError(pending->requestId, route.error ? route.error : "unsupported_device_prompt",
+                  "Could not confidently route the named-device request");
+      } else {
+        const char *alias = result.candidateAliases[route.targetIndex];
+        const DeviceBinding *binding = deviceRegistry.find(alias);
+        if (!binding) {
+          sendError(pending->requestId, "device_not_found",
+                    "The routed device changed before inference completed");
+        } else {
+          TaskRequest request;
+          strlcpy(request.alias, binding->alias, sizeof(request.alias));
+          if (route.action == DeviceRouteResult::SET_ON) {
+            request.operation = TaskOperation::DEVICE_SET;
+            request.state = true;
+          } else if (route.action == DeviceRouteResult::SET_OFF) {
+            request.operation = TaskOperation::DEVICE_SET;
+            request.state = false;
+          } else {
+            request.operation = TaskOperation::DEVICE_GET;
+          }
+          submitTask(pending->requestId, request, tinyDecide.name(),
+                     min(route.confidence, route.targetConfidence));
+        }
+      }
+    } else {
+      TinyDecideResult &decision = result.led;
+      if (decision.action == TinyDecideResult::LED_OFF) {
+        TaskRequest request;
+        request.operation = TaskOperation::DEVICE_SET;
+        strlcpy(request.alias, "status_led", sizeof(request.alias));
+        request.state = false;
+        submitTask(pending->requestId, request, tinyDecide.name(), decision.confidence);
+      } else if (decision.action == TinyDecideResult::SET_LED) {
+        submitLedColor(pending->requestId, decision.r, decision.g, decision.b,
+                       decision.brightness, tinyDecide.name(), decision.confidence);
+      } else if (decision.action == TinyDecideResult::UNSUPPORTED) {
+        sendTinyDecideResponse(pending->requestId, decision, false, "unsupported_prompt",
+                               decision.error ? decision.error : "TinyDecide rejected the prompt");
+      } else {
+        handleFallbackPrompt(pending->requestId, String(pending->prompt));
+      }
+    }
+    *pending = PendingInference{};
+    setResponseContext(&serialResponseSink, "serial");
+  }
+}
+
+void processIngress() {
+  IngressRequest ingress;
+  if (!ingressQueue.pop(ingress)) return;
+  activeIngress = &ingress;
+  if (ingress.origin == IngressOrigin::HTTP_REQUEST) {
+    HttpResponseSink sink(ingress.httpRequest);
+    setResponseContext(&sink, ingress.session);
+    handleLine(String(ingress.payload), "http");
+  } else {
+    setResponseContext(&serialResponseSink, ingress.session);
+    handleLine(String(ingress.payload), "serial");
+  }
+  activeIngress = nullptr;
+  setResponseContext(&serialResponseSink, "serial");
+}
+
+struct HttpBodyBuffer {
+  String body;
+  bool rejected = false;
+};
+
 void setup() {
   Serial.begin(115200);
   delay(250);
   Serial.println("MicroNeedle ESP32-S3 starting");
   deviceRegistry.begin();
   taskExecutor.begin();
+  ingressQueue.begin();
   Serial.printf("Device registry: %u binding(s) loaded\n", static_cast<unsigned>(deviceRegistry.count()));
-  if (tinyDecide.begin()) {
-    Serial.println("Model backend: TinyDecide 10.4M Q4");
+  inferenceReady = tinyDecide.begin() && inferenceWorker.begin();
+  if (inferenceReady) {
+    Serial.println("Model backend: TinyDecide 10.4M Q4 (asynchronous worker)");
   } else {
     Serial.println("Model backend: n-gram fallback (TinyDecide partition unavailable)");
   }
   Serial.println("Send plain text prompts or versioned JSON lines.");
 
-#if defined(MICRONEEDLE_WIFI_SSID) && defined(MICRONEEDLE_WIFI_PASSWORD) && \
-    defined(MICRONEEDLE_EXPERIMENTAL_HTTP_PROMPT)
-  // Experimental only: these handlers run on the AsyncWebServer task. Keep
-  // disabled until requests/responses are moved through the bounded owner-loop
-  // ingress queue, so model inference, NVS, Serial, and GPIO remain single-owner.
+#if defined(MICRONEEDLE_WIFI_SSID) && defined(MICRONEEDLE_WIFI_PASSWORD)
   WiFi.mode(WIFI_STA);
   WiFi.begin(MICRONEEDLE_WIFI_SSID, MICRONEEDLE_WIFI_PASSWORD);
   Serial.print("Connecting to Wi-Fi");
@@ -1090,33 +1246,41 @@ void setup() {
     });
     webServer.on("/prompt", HTTP_GET, [](AsyncWebServerRequest *request) {
       if (!request->hasParam("text")) {
-        request->send(400, "application/json", "{\"success\":false,\"error\":\"missing_text\"}");
+        request->send(400, "application/json",
+                      "{\"success\":false,\"error\":{\"code\":\"missing_text\"}}");
         return;
       }
-      String prompt = request->getParam("text")->value();
-      bool accepted = handlePrompt("http", prompt);
-      request->send(accepted ? 200 : 422, "application/json",
-                    accepted ? "{\"success\":true}" : "{\"success\":false,\"error\":\"unsupported_prompt\"}");
+      enqueueHttp(request, request->getParam("text")->value());
     });
-    webServer.on("/prompt", HTTP_POST, [](AsyncWebServerRequest *request) {}, nullptr,
+    webServer.on("/request", HTTP_POST, [](AsyncWebServerRequest *request) {}, nullptr,
       [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-        if (index != 0 || total > MICRONEEDLE_MAX_INPUT) {
-          if (index == 0) request->send(413, "application/json", "{\"success\":false,\"error\":\"input_too_large\"}");
-          return;
+        HttpBodyBuffer *buffer = static_cast<HttpBodyBuffer *>(request->_tempObject);
+        if (index == 0) {
+          buffer = new HttpBodyBuffer();
+          request->_tempObject = buffer;
+          if (!buffer || total > MICRONEEDLE_MAX_INPUT) {
+            if (buffer) buffer->rejected = true;
+            request->send(413, "application/json",
+                          "{\"success\":false,\"error\":{\"code\":\"input_too_large\"}}");
+          } else {
+            buffer->body.reserve(total);
+          }
         }
-        JsonDocument body;
-        if (deserializeJson(body, data, len) || !body["prompt"].is<const char *>()) {
-          request->send(400, "application/json", "{\"success\":false,\"error\":\"invalid_prompt_json\"}");
-          return;
+        if (!buffer) return;
+        if (!buffer->rejected && buffer->body.length() + len <= MICRONEEDLE_MAX_INPUT)
+          buffer->body.concat(reinterpret_cast<const char *>(data), len);
+        if (index + len == total) {
+          if (!buffer->rejected) enqueueHttp(request, buffer->body);
+          delete buffer;
+          request->_tempObject = nullptr;
         }
-        bool accepted = handlePrompt("http", body["prompt"].as<String>());
-        request->send(accepted ? 200 : 422, "application/json",
-                      accepted ? "{\"success\":true}" : "{\"success\":false,\"error\":\"prompt_rejected\"}");
       });
+    webServer.addHandler(&taskEvents);
     webServer.begin();
     Serial.print("HTTP prompt endpoint: http://");
     Serial.print(WiFi.localIP());
     Serial.println("/prompt?text=turn%20the%20LED%20orange");
+    Serial.println("HTTP JSON endpoint: POST /request; task events: GET /events");
   } else {
     Serial.println("Wi-Fi unavailable; serial prompt input remains active.");
   }
@@ -1129,7 +1293,14 @@ void loop() {
     char c = static_cast<char>(Serial.read());
     if (c == '\n' || c == '\r') {
       if (line.length()) {
-        handleLine(line);
+        IngressRequest ingress;
+        ingress.origin = IngressOrigin::SERIAL_INPUT;
+        strlcpy(ingress.payload, line.c_str(), sizeof(ingress.payload));
+        strlcpy(ingress.session, "serial", sizeof(ingress.session));
+        if (!ingressQueue.push(ingress)) {
+          setResponseContext(&serialResponseSink, "serial");
+          sendError("serial", "ingress_queue_full", "Too many pending requests");
+        }
         line = "";
       }
     } else if (line.length() <= MICRONEEDLE_MAX_INPUT) {
@@ -1137,6 +1308,8 @@ void loop() {
     }
   }
 
+  processInferenceResults();
+  processIngress();
   taskExecutor.tick();
   deviceRegistry.tick();
   TaskRecord event;

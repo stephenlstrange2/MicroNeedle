@@ -67,3 +67,37 @@ After upload, exercise representative schema failures and verify `invalid_args` 
 ```
 
 Verify valid direct JSON and equivalent prompts both queue tasks, deterministic prompts report `routing.mode: deterministic`, TinyDecide-assisted prompts report `routing.mode: model`, and `device.capabilities` returns schemas only for implemented tools. Until observed, Milestone B is source-complete and build-verified, not serial hardware-accepted.
+
+### Milestone C — Safe ingress and transport responses
+
+- Default command: `$HOME/.venvs/platformio/bin/pio run -e esp32-s3-devkitc-1-n16r8`
+- Result: passed on 2026-10-06.
+- Default size: 58,680 bytes RAM of 327,680 (17.9%); 557,788 bytes flash of 3,145,728 (17.7%).
+
+- Wi-Fi compile command: `PLATFORMIO_BUILD_FLAGS='-DBOARD_HAS_PSRAM -mfix-esp32-psram-cache-issue -DCORE_DEBUG_LEVEL=3 -DKM_RGB_PIN=48 -DMICRONEEDLE_WIFI_SSID=\"test\" -DMICRONEEDLE_WIFI_PASSWORD=\"test\"' $HOME/.venvs/platformio/bin/pio run -e esp32-s3-devkitc-1-n16r8`
+- Result: passed on 2026-10-06, including `/health`, `/prompt`, chunked `/request`, and `/events` code paths normally excluded without credentials.
+- Wi-Fi size: 76,332 bytes RAM of 327,680 (23.3%); 1,063,499 bytes flash of 3,145,728 (33.8%).
+
+- Command: `git diff --check`
+- Result: passed on 2026-10-06 with no whitespace errors.
+
+- Source inspection: HTTP callbacks call `enqueueHttp` and do not invoke prompt, tool, registry, task, NVS, model, or driver handlers.
+- Source inspection: both serial and HTTP are consumed by `processIngress` on the owner loop through an eight-entry `IngressQueue`.
+- Source inspection: all TinyDecide `interpret`/`routeDevice` calls are confined to `inference_worker.cpp`; results return to `processInferenceResults` before task/registry mutation.
+- Source inspection: all normal protocol responses use `ResponseSink`; terminal task events are sent to serial and `/events` SSE clients.
+- Source inspection: confirmation proposals store session plus an operation digest, and confirm/reject require the same session.
+- Failure encountered and corrected: the first build used enum member `SERIAL`, which collided with Arduino's `SERIAL` macro. It was renamed to `SERIAL_INPUT`; both final builds pass.
+
+#### Concurrent hardware/network acceptance still pending
+
+With Wi-Fi credentials configured, upload and verify:
+
+1. `/health` responds while a TinyDecide request is still running.
+2. A deterministic serial command completes while HTTP TinyDecide inference is running.
+3. Chunked `POST /request` returns the same structured task/confirmation/error objects as serial.
+4. `/events` receives task terminal events, and `task.status` can retrieve the same task.
+5. More than eight queued ingress requests return `ingress_queue_full` without corruption.
+6. A confirmation proposed with session `client-1` fails under `client-2` with `confirmation_session_mismatch`, then succeeds once under `client-1`.
+7. Oversized and disconnected HTTP bodies do not leak enough memory to impair subsequent requests.
+
+Until these are observed, Milestone C is source-complete and build-verified, not concurrent hardware/network accepted.

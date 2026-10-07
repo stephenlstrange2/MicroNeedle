@@ -4,7 +4,7 @@ All notable changes are documented here.
 
 ## Unreleased
 
-Firmware metadata now reports `microneedle-0.3.0` for the system-device and typed-tool milestones.
+Firmware metadata now reports `microneedle-0.4.0` for the safe-ingress and asynchronous-inference milestone.
 
 ### Added
 
@@ -15,6 +15,11 @@ Firmware metadata now reports `microneedle-0.3.0` for the system-device and type
 - `led.pattern` JSON tool and RGB/pattern details in task completion results.
 - Declarative typed tool registry with required-field, type, enum, range, and unknown-argument validation.
 - Central command validator shared by prompt-derived, confirmed, and direct JSON task submissions.
+- Eight-entry bounded ingress queue shared by serial and HTTP transports.
+- Serial and HTTP response sinks that return the same structured protocol payloads.
+- Four-entry serialized TinyDecide worker queue with owner-loop result continuation.
+- `/request` JSON endpoint, `/events` Server-Sent Events task stream, and chunk-safe HTTP body accumulation.
+- Confirmation session binding and operation-digest verification.
 
 ### Changed
 
@@ -25,3 +30,6 @@ Firmware metadata now reports `microneedle-0.3.0` for the system-device and type
 - Capability advertisement is generated from registered tool definitions instead of a duplicated manual list.
 - Task acknowledgements use consistent `routing.backend`, `routing.mode`, and `routing.confidence` metadata; deterministic alias commands are no longer mislabeled as TinyDecide decisions.
 - Registered JSON tools dispatch by stable typed IDs after centralized schema validation.
+- HTTP callbacks now enqueue immutable requests instead of invoking registry, model, task, NVS, or hardware code.
+- TinyDecide inference runs off the owner loop so task polling and asynchronous health checks continue during inference.
+- Wi-Fi transport enablement now requires only SSID and password build flags; the prior experimental HTTP flag is removed.

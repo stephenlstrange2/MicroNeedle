@@ -150,19 +150,38 @@ Task acknowledgements include routing provenance:
 
 The N16R8 board profile conservatively rejects boot-strapping, USB, JTAG/debug, console, flash/PSRAM, and both known onboard WS2812B pins (GPIO 38/48). Never connect a mains-powered lamp directly to a GPIO; use a correctly rated and isolated relay or driver circuit.
 
-Confirmation tokens are random, one-time, expire after 30 seconds, and occupy a bounded four-entry table. A request field such as `"confirmed": true` is intentionally ignored and cannot bypass confirmation.
+Confirmation tokens are random, one-time, expire after 30 seconds, and occupy a bounded four-entry table. Tokens are bound to the originating serial or HTTP session and to a digest of the exact proposed operation. A request field such as `"confirmed": true` is intentionally ignored and cannot bypass confirmation.
 
 ## Optional Wi-Fi
 
-The HTTP prompt path is currently experimental and disabled by default while it is moved behind a bounded single-owner ingress queue. To compile the existing prototype, define `MICRONEEDLE_WIFI_SSID`, `MICRONEEDLE_WIFI_PASSWORD`, and `MICRONEEDLE_EXPERIMENTAL_HTTP_PROMPT` in `build_flags`. It exposes:
+Define `MICRONEEDLE_WIFI_SSID` and `MICRONEEDLE_WIFI_PASSWORD` in `build_flags` to enable:
 
 ```text
-GET /health
-GET /prompt?text=turn%20the%20LED%20orange
-POST /prompt  {"prompt":"turn the LED orange"}
+GET  /health
+GET  /prompt?text=turn%20the%20LED%20orange
+POST /request
+GET  /events
 ```
 
-Serial is the supported control transport for named-device configuration in this milestone. The experimental HTTP handlers return only generic HTTP results and may not receive full structured task/confirmation responses; do not expose them to untrusted networks.
+`POST /request` accepts the same versioned JSON object used over serial, including prompts and direct tools. Request bodies are accumulated across HTTP chunks with a 768-byte limit. Both serial and HTTP feed an eight-entry bounded ingress queue; only the owner loop parses requests or mutates the registry, tasks, confirmations, NVS, and hardware.
+
+TinyDecide runs on a dedicated serialized worker, so its multi-second inference does not stop task polling or the asynchronous `/health` endpoint. HTTP receives the real structured acknowledgement/error from the owner loop. Task terminal events are available as Server-Sent Events from `/events` and remain available through `task.status`/`task.list`.
+
+For confirmation operations, supply a stable `X-MicroNeedle-Session` header on both proposal and confirmation requests. Without it, the remote IP is used as the session identity:
+
+```sh
+curl -H 'X-MicroNeedle-Session: client-1' \
+  'http://DEVICE_IP/prompt?text=bind%20GPIO%204%20as%20desk%20lamp'
+
+curl -H 'Content-Type: application/json' \
+  -H 'X-MicroNeedle-Session: client-1' \
+  --data '{"v":1,"id":"c1","tool":"confirmation.confirm","args":{"confirmation_id":123}}' \
+  http://DEVICE_IP/request
+
+curl -N http://DEVICE_IP/events
+```
+
+HTTP currently has session binding but no authentication or TLS. Keep it on a trusted network until Milestone H authorization is implemented.
 
 ## Flash layout
 
