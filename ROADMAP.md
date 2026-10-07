@@ -472,6 +472,8 @@ Acceptance:
 - Advertised tools always have implementations.
 - No driver is reachable without tool-schema and capability validation.
 
+Implementation status (2026-10-06): implemented in source and firmware-build verified. Typed definitions now generate capability schemas, JSON arguments receive centralized structural validation, and every queued task receives the same semantic command validation regardless of prompt/confirmation/JSON origin. Serial hardware acceptance checks for representative valid and invalid requests remain pending; see `EVIDENCE.md`.
+
 ### Milestone C — Safe single-owner ingress and transport responses
 
 Serial is currently the supported control path. Make HTTP and later transports production-safe:

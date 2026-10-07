@@ -1,5 +1,7 @@
 #include "task_executor.h"
 
+#include "command_validator.h"
+
 #include <cstring>
 
 namespace {
@@ -80,6 +82,7 @@ bool TaskExecutor::submit(const TaskRequest &request, uint32_t &taskId, const ch
     if (error) *error = "executor_not_ready";
     return false;
   }
+  if (!CommandValidator::validate(request, registry_, error)) return false;
   const int slot = reusableSlot();
   if (slot < 0) {
     if (error) *error = "task_pool_full";

@@ -38,3 +38,32 @@ led brown
 ```
 
 Also verify JSON `device.describe` for `status_led`, task IDs and completion events for every valid operation, `unsupported_color` for brown, preservation of existing NVS user bindings, and the actual onboard LED pin for the board revision. Until these checks are observed, Milestone A is source-complete and build-verified, not hardware-accepted.
+
+### Milestone B — Typed tools and centralized validation
+
+- Command: `$HOME/.venvs/platformio/bin/pio run -e esp32-s3-devkitc-1-n16r8`
+- Result: passed on 2026-10-06 after adding `tool_registry.cpp` and `command_validator.cpp`.
+- Size evidence: 45,056 bytes RAM of 327,680 (13.8%); 543,308 bytes flash of 3,145,728 (17.3%).
+- Supports: compilation/linkage of typed tool definitions, generated capability schemas, centralized JSON validation, centralized task validation, typed-ID dispatch, and routing provenance.
+
+- Command: `git diff --check`
+- Result: passed on 2026-10-06 with no whitespace errors.
+
+- Source inspection: `device.capabilities` iterates `ToolRegistry::count()` rather than maintaining a manual advertised-tool list.
+- Source inspection: `handleTool` resolves a `ToolDefinition`, validates its argument object, and dispatches by `ToolId`; no `strcmp(tool, ...)` dispatch remains.
+- Source inspection: the only call to `TaskExecutor::submit` is the shared `submitTask` path, and `TaskExecutor::submit` invokes `CommandValidator::validate` before allocating or queueing a task.
+- Source inspection: confirmation proposals also invoke `CommandValidator::validate` before tokens are allocated.
+
+#### Serial acceptance still pending
+
+After upload, exercise representative schema failures and verify `invalid_args` without a task or hardware mutation:
+
+```json
+{"v":1,"id":"bad1","tool":"led.set","args":{"r":256,"g":0,"b":0}}
+{"v":1,"id":"bad2","tool":"led.pattern","args":{"pattern":"sparkle"}}
+{"v":1,"id":"bad3","tool":"device.set","args":{"alias":"desk_lamp","state":"maybe"}}
+{"v":1,"id":"bad4","tool":"device.list","args":{"unexpected":true}}
+{"v":1,"id":"bad5","tool":"device.bind","args":{"alias":"unsafe","pin":48}}
+```
+
+Verify valid direct JSON and equivalent prompts both queue tasks, deterministic prompts report `routing.mode: deterministic`, TinyDecide-assisted prompts report `routing.mode: model`, and `device.capabilities` returns schemas only for implemented tools. Until observed, Milestone B is source-complete and build-verified, not serial hardware-accepted.

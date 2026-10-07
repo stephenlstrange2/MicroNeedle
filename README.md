@@ -140,6 +140,14 @@ Equivalent JSON tools include:
 
 All device operations run through a 16-slot bounded priority executor. Requests first receive a queued task ID and later produce `task.completed`, `task.failed`, `task.cancelled`, or `task.timed_out` events. Inspect and cancel tasks with `task.status`, `task.list`, and `task.cancel`.
 
+JSON tools are declared in a typed registry. Before dispatch, the firmware rejects missing required fields, wrong types, values outside allowed ranges, invalid enum values, and unknown arguments. Prompt-derived tasks, confirmed configuration tasks, and direct JSON tasks then pass through the same semantic command validator for alias, capability, board-profile, resource-conflict, and system-device checks. `device.capabilities` returns the registered tools and their generated argument schemas/flags.
+
+Task acknowledgements include routing provenance:
+
+```json
+{"routing":{"backend":"deterministic-device-router","mode":"deterministic","confidence":1.0}}
+```
+
 The N16R8 board profile conservatively rejects boot-strapping, USB, JTAG/debug, console, flash/PSRAM, and both known onboard WS2812B pins (GPIO 38/48). Never connect a mains-powered lamp directly to a GPIO; use a correctly rated and isolated relay or driver circuit.
 
 Confirmation tokens are random, one-time, expire after 30 seconds, and occupy a bounded four-entry table. A request field such as `"confirmed": true` is intentionally ignored and cannot bypass confirmation.

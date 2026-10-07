@@ -8,6 +8,8 @@
 #include "device_registry.h"
 #include "task_executor.h"
 #include "confirmation_manager.h"
+#include "command_validator.h"
+#include "tool_registry.h"
 
 #ifndef KM_RGB_PIN
 #define KM_RGB_PIN 48
@@ -75,8 +77,12 @@ void sendTaskAccepted(const char *id, uint32_t taskId, const char *tool,
   task["id"] = taskId;
   task["tool"] = tool;
   task["status"] = "queued";
-  if (backend) response["model"]["backend"] = backend;
-  if (confidence >= 0.0f) response["model"]["confidence"] = confidence;
+  if (backend) {
+    JsonObject routing = response["routing"].to<JsonObject>();
+    routing["backend"] = backend;
+    routing["mode"] = strstr(backend, "tinydecide") ? "model" : "deterministic";
+    if (confidence >= 0.0f) routing["confidence"] = confidence;
+  }
   serializeJson(response, Serial);
   Serial.println();
 }
@@ -107,6 +113,12 @@ void sendConfirmation(const char *id, uint32_t confirmationId, const TaskRequest
 }
 
 bool proposeConfirmation(const char *id, const TaskRequest &request) {
+  const char *validationError = nullptr;
+  if (!CommandValidator::validate(request, deviceRegistry, &validationError)) {
+    sendError(id, validationError ? validationError : "validation_failed",
+              "Proposed configuration failed centralized validation");
+    return false;
+  }
   const uint32_t confirmationId = confirmations.propose(request);
   if (!confirmationId) {
     sendError(id, "confirmation_capacity_full", "Too many pending confirmations");
@@ -234,6 +246,9 @@ void sendPromptResponse(const char *id, const IntentPrediction &prediction,
   response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
   response["id"] = id ? id : "";
   response["success"] = success;
+  response["routing"]["backend"] = "ngram-fallback";
+  response["routing"]["mode"] = "model";
+  response["routing"]["confidence"] = prediction.confidence;
   JsonObject result = response["result"].to<JsonObject>();
   result["intent"] = prediction.label;
   result["confidence"] = prediction.confidence;
@@ -252,6 +267,10 @@ void sendTinyDecideResponse(const char *id, const TinyDecideResult &decision,
   response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
   response["id"] = id ? id : "";
   response["success"] = success;
+  JsonObject routing = response["routing"].to<JsonObject>();
+  routing["backend"] = tinyDecide.name();
+  routing["mode"] = "model";
+  routing["confidence"] = decision.confidence;
   JsonObject result = response["result"].to<JsonObject>();
   result["backend"] = tinyDecide.name();
   result["confidence"] = decision.confidence;
@@ -287,7 +306,7 @@ void sendInfo(const char *id, bool capabilities) {
   response["id"] = id ? id : "";
   response["success"] = true;
   JsonObject result = response["result"].to<JsonObject>();
-  result["firmware"] = "microneedle-0.2.0";
+  result["firmware"] = "microneedle-0.3.0";
   result["protocol"] = MICRONEEDLE_PROTOCOL_VERSION;
   result["chip"] = ESP.getChipModel();
   result["cpu_mhz"] = ESP.getCpuFreqMHz();
@@ -298,22 +317,32 @@ void sendInfo(const char *id, bool capabilities) {
   result["model_backend"] = tinyDecide.ready() ? tinyDecide.name() : "ngram-fallback";
   if (capabilities) {
     JsonArray tools = result["tools"].to<JsonArray>();
-    tools.add("device.info");
-    tools.add("device.capabilities");
-    tools.add("led.set");
-    tools.add("led.off");
-    tools.add("led.pattern");
-    tools.add("device.bind");
-    tools.add("device.unbind");
-    tools.add("device.rename");
-    tools.add("device.list");
-    tools.add("device.describe");
-    tools.add("device.get");
-    tools.add("device.set");
-    tools.add("task.status");
-    tools.add("task.cancel");
-    tools.add("task.list");
-    tools.add("confirmation.confirm");
+    JsonArray schemas = result["tool_schemas"].to<JsonArray>();
+    for (size_t i = 0; i < ToolRegistry::count(); ++i) {
+      const ToolDefinition *definition = ToolRegistry::at(i);
+      if (!definition) continue;
+      tools.add(definition->name);
+      JsonObject schema = schemas.add<JsonObject>();
+      schema["name"] = definition->name;
+      schema["mutates_hardware"] = (definition->flags & TOOL_MUTATES_HARDWARE) != 0;
+      schema["configuration"] = (definition->flags & TOOL_CONFIGURATION) != 0;
+      schema["requires_confirmation"] = (definition->flags & TOOL_REQUIRES_CONFIRMATION) != 0;
+      JsonArray arguments = schema["args"].to<JsonArray>();
+      for (uint8_t argumentIndex = 0; argumentIndex < definition->argCount; ++argumentIndex) {
+        const ToolArgRule &rule = definition->args[argumentIndex];
+        JsonObject argument = arguments.add<JsonObject>();
+        argument["name"] = rule.name;
+        argument["type"] = ToolRegistry::argTypeName(rule.type);
+        argument["required"] = rule.required;
+        if (rule.minimum != INT32_MIN) argument["minimum"] = rule.minimum;
+        if (rule.maximum != INT32_MAX) argument["maximum"] = rule.maximum;
+        if (rule.allowedValues) {
+          JsonArray allowed = argument["allowed"].to<JsonArray>();
+          for (uint8_t valueIndex = 0; valueIndex < rule.allowedValueCount; ++valueIndex)
+            allowed.add(rule.allowedValues[valueIndex]);
+        }
+      }
+    }
     result["board_profile"] = BoardProfile::name();
     result["device_count"] = deviceRegistry.visibleCount();
     result["task_capacity"] = MICRONEEDLE_MAX_TASKS;
@@ -590,6 +619,7 @@ bool handleNamedDevicePrompt(const char *id, const String &prompt, const String 
   TaskRequest request;
   request.priority = TaskPriority::INTERACTIVE;
   float confidence = 1.0f;
+  bool modelAssisted = false;
   const DeviceBinding *target = candidates[0];
 
   // Explicit, safely grounded command phrases do not need probabilistic
@@ -619,6 +649,7 @@ bool handleNamedDevicePrompt(const char *id, const String &prompt, const String 
       request.state = explicitOn;
     }
   } else if (tinyDecide.ready()) {
+    modelAssisted = true;
     DeviceRouteResult route = tinyDecide.routeDevice(prompt, names, candidateCount);
     if (route.action == DeviceRouteResult::ERROR || route.action == DeviceRouteResult::UNSUPPORTED ||
         route.targetIndex < 0 || static_cast<size_t>(route.targetIndex) >= candidateCount) {
@@ -642,7 +673,7 @@ bool handleNamedDevicePrompt(const char *id, const String &prompt, const String 
     return false;
   }
   strlcpy(request.alias, target->alias, sizeof(request.alias));
-  return submitTask(id, request, tinyDecide.ready() ? tinyDecide.name() : "deterministic-device-router",
+  return submitTask(id, request, modelAssisted ? tinyDecide.name() : "deterministic-device-router",
                     confidence);
 }
 
@@ -763,17 +794,34 @@ bool getByte(JsonObject args, const char *key, uint8_t &value) {
 }
 
 void handleTool(JsonDocument &request, const char *id, const char *tool) {
+  const ToolDefinition *definition = ToolRegistry::find(tool);
+  if (!definition) {
+    sendError(id, "unknown_tool", "Tool is not registered");
+    return;
+  }
+  if (!request["args"].isNull() && !request["args"].is<JsonObject>()) {
+    sendError(id, "invalid_args", "args must be an object");
+    return;
+  }
   JsonObject args = request["args"].as<JsonObject>();
-  if (strcmp(tool, "device.info") == 0) { sendInfo(id, false); return; }
-  if (strcmp(tool, "device.capabilities") == 0) { sendInfo(id, true); return; }
-  if (strcmp(tool, "device.list") == 0) { sendDeviceList(id); return; }
-  if (strcmp(tool, "device.describe") == 0) {
+  JsonObjectConst validationArgs = request["args"].as<JsonObjectConst>();
+  char validationMessage[96] = {};
+  if (!ToolRegistry::validate(*definition, validationArgs, validationMessage,
+                              sizeof(validationMessage))) {
+    sendError(id, "invalid_args", validationMessage);
+    return;
+  }
+
+  if (definition->id == ToolId::DEVICE_INFO) { sendInfo(id, false); return; }
+  if (definition->id == ToolId::DEVICE_CAPABILITIES) { sendInfo(id, true); return; }
+  if (definition->id == ToolId::DEVICE_LIST) { sendDeviceList(id); return; }
+  if (definition->id == ToolId::DEVICE_DESCRIBE) {
     if (!args["alias"].is<const char *>()) sendError(id, "invalid_args", "alias is required");
     else sendDeviceDescription(id, args["alias"].as<const char *>());
     return;
   }
 
-  if (strcmp(tool, "confirmation.confirm") == 0) {
+  if (definition->id == ToolId::CONFIRMATION_CONFIRM) {
     if (!args["confirmation_id"].is<uint32_t>()) {
       sendError(id, "invalid_args", "confirmation_id is required");
       return;
@@ -788,7 +836,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
     return;
   }
 
-  if (strcmp(tool, "device.bind") == 0) {
+  if (definition->id == ToolId::DEVICE_BIND) {
     if (!args["alias"].is<const char *>() || !args["pin"].is<int>()) {
       sendError(id, "invalid_args", "device.bind requires alias and pin");
       return;
@@ -826,7 +874,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
     return;
   }
 
-  if (strcmp(tool, "device.unbind") == 0 || strcmp(tool, "device.rename") == 0) {
+  if (definition->id == ToolId::DEVICE_UNBIND || definition->id == ToolId::DEVICE_RENAME) {
     if (!args["alias"].is<const char *>()) {
       sendError(id, "invalid_args", "alias is required");
       return;
@@ -837,7 +885,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
       return;
     }
     TaskRequest task;
-    task.operation = strcmp(tool, "device.unbind") == 0 ?
+    task.operation = definition->id == ToolId::DEVICE_UNBIND ?
                      TaskOperation::DEVICE_UNBIND : TaskOperation::DEVICE_RENAME;
     strlcpy(task.alias, alias, sizeof(task.alias));
     if (task.operation == TaskOperation::DEVICE_RENAME) {
@@ -856,7 +904,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
     return;
   }
 
-  if (strcmp(tool, "device.set") == 0 || strcmp(tool, "device.get") == 0) {
+  if (definition->id == ToolId::DEVICE_SET || definition->id == ToolId::DEVICE_GET) {
     if (!args["alias"].is<const char *>()) {
       sendError(id, "invalid_args", "alias is required");
       return;
@@ -867,7 +915,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
       return;
     }
     TaskRequest task;
-    task.operation = strcmp(tool, "device.set") == 0 ?
+    task.operation = definition->id == ToolId::DEVICE_SET ?
                      TaskOperation::DEVICE_SET : TaskOperation::DEVICE_GET;
     strlcpy(task.alias, alias, sizeof(task.alias));
     if (task.operation == TaskOperation::DEVICE_SET) {
@@ -889,7 +937,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
     return;
   }
 
-  if (strcmp(tool, "task.status") == 0) {
+  if (definition->id == ToolId::TASK_STATUS) {
     if (!args["task_id"].is<uint32_t>()) {
       sendError(id, "invalid_args", "task_id is required");
       return;
@@ -900,7 +948,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
     return;
   }
 
-  if (strcmp(tool, "task.cancel") == 0) {
+  if (definition->id == ToolId::TASK_CANCEL) {
     if (!args["task_id"].is<uint32_t>()) {
       sendError(id, "invalid_args", "task_id is required");
       return;
@@ -912,7 +960,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
     return;
   }
 
-  if (strcmp(tool, "task.list") == 0) {
+  if (definition->id == ToolId::TASK_LIST) {
     JsonDocument response;
     response["v"] = MICRONEEDLE_PROTOCOL_VERSION;
     response["id"] = id;
@@ -931,7 +979,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
     return;
   }
 
-  if (strcmp(tool, "led.off") == 0) {
+  if (definition->id == ToolId::LED_OFF) {
     TaskRequest task;
     task.operation = TaskOperation::DEVICE_SET;
     strlcpy(task.alias, "status_led", sizeof(task.alias));
@@ -939,7 +987,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
     submitTask(id, task, "json-tool", 1.0f);
     return;
   }
-  if (strcmp(tool, "led.set") == 0) {
+  if (definition->id == ToolId::LED_SET) {
     uint8_t r, g, b, brightness = 255;
     if (!getByte(args, "r", r) || !getByte(args, "g", g) || !getByte(args, "b", b)) {
       sendError(id, "invalid_args", "led.set requires r, g, and b values from 0 to 255");
@@ -952,7 +1000,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
     submitLedColor(id, r, g, b, brightness, "json-tool", 1.0f);
     return;
   }
-  if (strcmp(tool, "led.pattern") == 0) {
+  if (definition->id == ToolId::LED_PATTERN) {
     if (!args["pattern"].is<const char *>()) {
       sendError(id, "invalid_args", "led.pattern requires blink, pulse, rainbow, or solid");
       return;
@@ -969,7 +1017,7 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
     submitTask(id, task, "json-tool", 1.0f);
     return;
   }
-  sendError(id, "unknown_tool", "Tool is not registered");
+  sendError(id, "tool_dispatch_error", "Registered tool has no handler");
 }
 
 void handleLine(String line) {
