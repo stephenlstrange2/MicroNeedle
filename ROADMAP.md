@@ -454,7 +454,7 @@ Acceptance:
 - `device.describe status_led` exposes accurate capabilities and configured pin.
 - Explicit supported colors execute without model inference.
 
-Implementation status (2026-10-06): implemented in source and firmware-build verified. On-device acceptance checks for physical color/pattern output and event payloads remain pending before declaring the milestone hardware-accepted. See `EVIDENCE.md`.
+Implementation status (2026-10-06): implemented, build-verified, and on-device serial/task acceptance passed for listing, orange/blue/brightness, blink/pulse/rainbow, off, persistence, and unsupported colors. Explicit physical-appearance attestation and `device.describe status_led` output remain pending before declaring full hardware acceptance. See `EVIDENCE.md`.
 
 ### Milestone B — Typed tool registry and centralized validation
 

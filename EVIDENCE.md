@@ -22,22 +22,22 @@ This file records reproducible validation evidence. A successful firmware build 
 - Source inspection: hardware writes (`digitalWrite`, NeoPixel `setPixelColor`/`show`) are confined to `src/device_driver.cpp`; `src/main.cpp` has no direct LED hardware mutation calls.
 - Source inspection: GPIO 38 and 48 remain reserved by `BoardProfile::isSystemClaimed`.
 
-#### Hardware acceptance still pending
+#### On-device serial acceptance — passed 2026-10-06
 
-After uploading to an ESP32-S3 board, verify and record actual serial output and physical LED behavior for:
+User-provided serial evidence from an ESP32-S3 showed:
 
-```text
-list devices
-led orange
-led blue brightness 40
-status led blink
-status led pulse
-status led rainbow
-turn off status led
-led brown
-```
+- `list devices` returned the persisted `desk_lamp` plus built-in `status_led` on GPIO 48.
+- `led orange` completed with RGB `(255,80,0)`, brightness 80, and `solid` pattern.
+- `led blue brightness 40` completed with RGB `(0,0,255)` and brightness 40.
+- `status led blink`, `pulse`, and `rainbow` each queued and emitted successful terminal events while retaining blue/brightness 40.
+- `turn off status led` completed with state `off` and pattern reset to `solid`.
+- `led brown` returned `unsupported_color` without creating a task.
+- Every accepted operation reported deterministic routing, a task ID, and `task.completed`.
+- The pre-existing NVS-backed `desk_lamp` remained present.
 
-Also verify JSON `device.describe` for `status_led`, task IDs and completion events for every valid operation, `unsupported_color` for brown, preservation of existing NVS user bindings, and the actual onboard LED pin for the board revision. Until these checks are observed, Milestone A is source-complete and build-verified, not hardware-accepted.
+#### Remaining Milestone A observations
+
+The transcript establishes on-device protocol and task acceptance. It does not explicitly attest the physical LED appearance, and it did not include JSON `device.describe` for `status_led`. Confirm those two observations before marking Milestone A fully hardware-accepted.
 
 ### Milestone B — Typed tools and centralized validation
 

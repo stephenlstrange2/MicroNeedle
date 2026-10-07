@@ -21,6 +21,10 @@ Firmware metadata now reports `microneedle-0.4.0` for the safe-ingress and async
 - `/request` JSON endpoint, `/events` Server-Sent Events task stream, and chunk-safe HTTP body accumulation.
 - Confirmation session binding and operation-digest verification.
 
+### Evidence
+
+- Recorded successful on-device serial/task acceptance for the built-in WS2812B device: listing, deterministic colors and brightness, blink/pulse/rainbow, off, persistence, and unsupported-color rejection.
+
 ### Changed
 
 - Onboard LED prompt, TinyDecide, fallback, and JSON paths now submit validated executor tasks instead of mutating the NeoPixel directly.
