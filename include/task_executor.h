@@ -8,7 +8,15 @@ static constexpr size_t MICRONEEDLE_MAX_TASKS = 16;
 
 enum class TaskPriority : uint8_t { CRITICAL = 0, INTERACTIVE = 1, NORMAL = 2, BACKGROUND = 3 };
 enum class TaskStatus : uint8_t { FREE, QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED, TIMED_OUT };
-enum class TaskOperation : uint8_t { DEVICE_BIND, DEVICE_UNBIND, DEVICE_RENAME, DEVICE_SET, DEVICE_GET };
+enum class TaskOperation : uint8_t {
+  DEVICE_BIND,
+  DEVICE_UNBIND,
+  DEVICE_RENAME,
+  DEVICE_SET,
+  DEVICE_SET_RGB,
+  DEVICE_SET_PATTERN,
+  DEVICE_GET
+};
 
 struct TaskRequest {
   TaskOperation operation = TaskOperation::DEVICE_GET;
@@ -18,6 +26,11 @@ struct TaskRequest {
   char newAlias[MICRONEEDLE_ALIAS_SIZE] = {};
   uint8_t pin = 0;
   bool state = false;
+  uint8_t r = 0;
+  uint8_t g = 0;
+  uint8_t b = 0;
+  uint8_t brightness = 80;
+  LedPattern pattern = LedPattern::SOLID;
   bool activeHigh = true;
   bool startupOn = false;
 };
@@ -31,6 +44,11 @@ struct TaskRecord {
   uint32_t completedAt = 0;
   char error[48] = {};
   bool resultState = false;
+  uint8_t resultR = 0;
+  uint8_t resultG = 0;
+  uint8_t resultB = 0;
+  uint8_t resultBrightness = 0;
+  LedPattern resultPattern = LedPattern::SOLID;
   bool eventReported = false;
   bool queuedReference = false;
 };

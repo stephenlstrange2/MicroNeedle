@@ -190,11 +190,23 @@ void TaskExecutor::execute(TaskRecord &task) {
     case TaskOperation::DEVICE_SET:
       result = registry_.set(task.request.alias, task.request.state);
       break;
+    case TaskOperation::DEVICE_SET_RGB:
+      result = registry_.setRgb(task.request.alias, task.request.r, task.request.g,
+                                task.request.b, task.request.brightness);
+      break;
+    case TaskOperation::DEVICE_SET_PATTERN:
+      result = registry_.setPattern(task.request.alias, task.request.pattern);
+      break;
     case TaskOperation::DEVICE_GET:
       result = registry_.get(task.request.alias);
       break;
   }
   task.resultState = result.state;
+  task.resultR = result.r;
+  task.resultG = result.g;
+  task.resultB = result.b;
+  task.resultBrightness = result.brightness;
+  task.resultPattern = result.pattern;
   if (result.success) task.status = TaskStatus::COMPLETED;
   else setError(task, result.error);
 }
@@ -239,6 +251,8 @@ const char *TaskExecutor::operationName(TaskOperation operation) {
     case TaskOperation::DEVICE_UNBIND: return "device.unbind";
     case TaskOperation::DEVICE_RENAME: return "device.rename";
     case TaskOperation::DEVICE_SET: return "device.set";
+    case TaskOperation::DEVICE_SET_RGB: return "led.set";
+    case TaskOperation::DEVICE_SET_PATTERN: return "led.pattern";
     case TaskOperation::DEVICE_GET: return "device.get";
   }
   return "unknown";

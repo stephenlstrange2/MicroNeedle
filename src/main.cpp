@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <Adafruit_NeoPixel.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include "model_backend.h"
@@ -19,9 +18,6 @@
 #endif
 
 static constexpr size_t MICRONEEDLE_MAX_INPUT = 768;
-static constexpr uint16_t LED_COUNT = 1;
-
-Adafruit_NeoPixel pixel(LED_COUNT, KM_RGB_PIN, NEO_GRB + NEO_KHZ800);
 AsyncWebServer webServer(80);
 IntentClassifier intentClassifier;
 TinyDecideBackend tinyDecide;
@@ -35,10 +31,18 @@ struct RgbValue {
   uint8_t b;
 };
 
-void setStatus(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness = 32) {
-  pixel.setBrightness(brightness);
-  pixel.setPixelColor(0, pixel.Color(r, g, b));
-  pixel.show();
+const char *driverName(DriverType driver) {
+  return driver == DriverType::WS2812_RGB ? "ws2812.rgb" : "gpio.output";
+}
+
+const char *patternName(LedPattern pattern) {
+  switch (pattern) {
+    case LedPattern::SOLID: return "solid";
+    case LedPattern::BLINK: return "blink";
+    case LedPattern::PULSE: return "pulse";
+    case LedPattern::RAINBOW: return "rainbow";
+  }
+  return "unknown";
 }
 
 void sendError(const char *id, const char *code, const char *message) {
@@ -130,16 +134,18 @@ void sendDeviceList(const char *id) {
   response["id"] = id ? id : "";
   response["success"] = true;
   JsonArray devices = response["result"]["devices"].to<JsonArray>();
-  for (size_t i = 0; i < MICRONEEDLE_MAX_DEVICES; ++i) {
+  for (size_t i = 0; i < DeviceRegistry::bindingSlots(); ++i) {
     const DeviceBinding *binding = deviceRegistry.bindingAt(i);
     if (!binding || !binding->occupied) continue;
     JsonObject device = devices.add<JsonObject>();
     device["id"] = binding->id;
     device["alias"] = binding->alias;
     device["display_name"] = binding->displayName;
-    device["driver"] = "gpio.output";
+    device["driver"] = driverName(binding->driver);
     device["pin"] = binding->pin;
-    device["active_level"] = binding->activeHigh ? "high" : "low";
+    device["system"] = binding->driver == DriverType::WS2812_RGB;
+    if (binding->driver == DriverType::GPIO_OUTPUT)
+      device["active_level"] = binding->activeHigh ? "high" : "low";
     device["state"] = binding->currentOn ? "on" : "off";
   }
   serializeJson(response, Serial);
@@ -160,15 +166,29 @@ void sendDeviceDescription(const char *id, const char *alias) {
   device["id"] = binding->id;
   device["alias"] = binding->alias;
   device["display_name"] = binding->displayName;
-  device["driver"] = "gpio.output";
+  device["driver"] = driverName(binding->driver);
   device["pin"] = binding->pin;
-  device["active_level"] = binding->activeHigh ? "high" : "low";
-  device["startup_state"] = binding->startupOn ? "on" : "off";
+  device["system"] = binding->driver == DriverType::WS2812_RGB;
+  if (binding->driver == DriverType::GPIO_OUTPUT) {
+    device["active_level"] = binding->activeHigh ? "high" : "low";
+    device["startup_state"] = binding->startupOn ? "on" : "off";
+  }
   device["state"] = binding->currentOn ? "on" : "off";
+  if (binding->driver == DriverType::WS2812_RGB) {
+    DeviceOperationResult led = deviceRegistry.get(binding->alias);
+    device["color"]["r"] = led.r;
+    device["color"]["g"] = led.g;
+    device["color"]["b"] = led.b;
+    device["brightness"] = led.brightness;
+    device["pattern"] = patternName(led.pattern);
+  }
   JsonArray capabilities = device["capabilities"].to<JsonArray>();
   if (binding->capabilities & CAP_ON) capabilities.add("on");
   if (binding->capabilities & CAP_OFF) capabilities.add("off");
   if (binding->capabilities & CAP_STATE) capabilities.add("state");
+  if (binding->capabilities & CAP_COLOR) capabilities.add("color");
+  if (binding->capabilities & CAP_BRIGHTNESS) capabilities.add("brightness");
+  if (binding->capabilities & CAP_PATTERN) capabilities.add("pattern");
   serializeJson(response, Serial);
   Serial.println();
 }
@@ -188,8 +208,19 @@ void sendTaskRecord(const char *id, const TaskRecord &record, bool event = false
   task["alias"] = record.request.alias;
   if (record.status == TaskStatus::COMPLETED &&
       (record.request.operation == TaskOperation::DEVICE_GET ||
-       record.request.operation == TaskOperation::DEVICE_SET)) {
+       record.request.operation == TaskOperation::DEVICE_SET ||
+       record.request.operation == TaskOperation::DEVICE_SET_RGB ||
+       record.request.operation == TaskOperation::DEVICE_SET_PATTERN)) {
     task["result"]["state"] = record.resultState ? "on" : "off";
+    if (record.request.operation == TaskOperation::DEVICE_SET_RGB ||
+        record.request.operation == TaskOperation::DEVICE_SET_PATTERN ||
+        strcmp(record.request.alias, "status_led") == 0) {
+      task["result"]["color"]["r"] = record.resultR;
+      task["result"]["color"]["g"] = record.resultG;
+      task["result"]["color"]["b"] = record.resultB;
+      task["result"]["brightness"] = record.resultBrightness;
+      task["result"]["pattern"] = patternName(record.resultPattern);
+    }
   }
   if (record.error[0]) task["error"] = record.error;
   serializeJson(response, Serial);
@@ -271,6 +302,7 @@ void sendInfo(const char *id, bool capabilities) {
     tools.add("device.capabilities");
     tools.add("led.set");
     tools.add("led.off");
+    tools.add("led.pattern");
     tools.add("device.bind");
     tools.add("device.unbind");
     tools.add("device.rename");
@@ -283,23 +315,30 @@ void sendInfo(const char *id, bool capabilities) {
     tools.add("task.list");
     tools.add("confirmation.confirm");
     result["board_profile"] = BoardProfile::name();
-    result["device_count"] = deviceRegistry.count();
+    result["device_count"] = deviceRegistry.visibleCount();
     result["task_capacity"] = MICRONEEDLE_MAX_TASKS;
   }
   serializeJson(response, Serial);
   Serial.println();
 }
 
-bool parseColor(String text, RgbValue &color) {
+bool hasWord(String text, const char *word) {
   text.toLowerCase();
-  if (text.indexOf("red") >= 0) { color = {255, 0, 0}; return true; }
-  if (text.indexOf("green") >= 0) { color = {0, 255, 0}; return true; }
-  if (text.indexOf("blue") >= 0) { color = {0, 0, 255}; return true; }
-  if (text.indexOf("orange") >= 0) { color = {255, 80, 0}; return true; }
-  if (text.indexOf("yellow") >= 0) { color = {255, 180, 0}; return true; }
-  if (text.indexOf("purple") >= 0 || text.indexOf("violet") >= 0) { color = {160, 0, 255}; return true; }
-  if (text.indexOf("pink") >= 0) { color = {255, 20, 100}; return true; }
-  if (text.indexOf("white") >= 0) { color = {255, 255, 255}; return true; }
+  text.replace('?', ' ');
+  text.replace('!', ' ');
+  text.replace(',', ' ');
+  return (" " + text + " ").indexOf(" " + String(word) + " ") >= 0;
+}
+
+bool parseColor(String text, RgbValue &color) {
+  if (hasWord(text, "red")) { color = {255, 0, 0}; return true; }
+  if (hasWord(text, "green")) { color = {0, 255, 0}; return true; }
+  if (hasWord(text, "blue")) { color = {0, 0, 255}; return true; }
+  if (hasWord(text, "orange")) { color = {255, 80, 0}; return true; }
+  if (hasWord(text, "yellow")) { color = {255, 180, 0}; return true; }
+  if (hasWord(text, "purple") || hasWord(text, "violet")) { color = {160, 0, 255}; return true; }
+  if (hasWord(text, "pink")) { color = {255, 20, 100}; return true; }
+  if (hasWord(text, "white")) { color = {255, 255, 255}; return true; }
   return false;
 }
 
@@ -316,14 +355,24 @@ uint8_t parseBrightness(String text, uint8_t fallback) {
   return static_cast<uint8_t>(constrain(number.toInt(), 0, 255));
 }
 
-bool validateAndSetLed(int r, int g, int b, int brightness) {
-  if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255 ||
-      brightness < 0 || brightness > 255) {
-    return false;
-  }
-  setStatus(static_cast<uint8_t>(r), static_cast<uint8_t>(g),
-            static_cast<uint8_t>(b), static_cast<uint8_t>(brightness));
-  return true;
+bool submitLedColor(const char *id, uint8_t r, uint8_t g, uint8_t b, uint8_t brightness,
+                    const char *backend = "deterministic-led-router", float confidence = 1.0f) {
+  TaskRequest request;
+  request.operation = TaskOperation::DEVICE_SET_RGB;
+  strlcpy(request.alias, "status_led", sizeof(request.alias));
+  request.r = r;
+  request.g = g;
+  request.b = b;
+  request.brightness = brightness;
+  return submitTask(id, request, backend, confidence);
+}
+
+bool parsePattern(const String &text, LedPattern &pattern) {
+  if (hasWord(text, "blink") || hasWord(text, "blinking")) { pattern = LedPattern::BLINK; return true; }
+  if (hasWord(text, "pulse") || hasWord(text, "pulsing")) { pattern = LedPattern::PULSE; return true; }
+  if (hasWord(text, "rainbow")) { pattern = LedPattern::RAINBOW; return true; }
+  if (hasWord(text, "solid")) { pattern = LedPattern::SOLID; return true; }
+  return false;
 }
 
 bool validAliasInput(const char *alias) {
@@ -448,7 +497,13 @@ bool handleConfigurationPrompt(const char *id, const String &normalized, bool &h
     return false;
   }
 
-  if (normalized == "list devices" || normalized == "show devices") {
+  const bool listRequest = normalized == "list devices" ||
+                           normalized == "show devices" ||
+                           normalized == "give me the devices" ||
+                           normalized == "get list of devices" ||
+                           normalized == "get list of devices?" ||
+                           normalized.indexOf("list of devices") >= 0;
+  if (listRequest) {
     sendDeviceList(id);
     return true;
   }
@@ -460,10 +515,10 @@ bool handleConfigurationPrompt(const char *id, const String &normalized, bool &h
 bool handleNamedDevicePrompt(const char *id, const String &prompt, const String &normalized,
                              bool &handled) {
   handled = false;
-  const DeviceBinding *candidates[MICRONEEDLE_MAX_DEVICES]{};
-  const char *names[MICRONEEDLE_MAX_DEVICES]{};
+  const DeviceBinding *candidates[DeviceRegistry::bindingSlots()]{};
+  const char *names[DeviceRegistry::bindingSlots()]{};
   size_t candidateCount = 0;
-  for (size_t i = 0; i < MICRONEEDLE_MAX_DEVICES; ++i) {
+  for (size_t i = 0; i < DeviceRegistry::bindingSlots(); ++i) {
     const DeviceBinding *binding = deviceRegistry.bindingAt(i);
     if (!binding || !binding->occupied) continue;
     String name = binding->displayName;
@@ -473,14 +528,97 @@ bool handleNamedDevicePrompt(const char *id, const String &prompt, const String 
     names[candidateCount] = binding->displayName;
     ++candidateCount;
   }
-  if (!candidateCount) return false;
+
+  // Allow a unique shortened reference such as "my desk" for "desk lamp".
+  // It is accepted only when exactly one registered alias contains that whole
+  // word, avoiding probabilistic target invention.
+  if (!candidateCount) {
+    String words = normalized;
+    words.replace('?', ' ');
+    words.replace('!', ' ');
+    int start = 0;
+    while (start < static_cast<int>(words.length())) {
+      while (start < static_cast<int>(words.length()) && words[start] == ' ') ++start;
+      int end = words.indexOf(' ', start);
+      if (end < 0) end = words.length();
+      String word = words.substring(start, end);
+      const bool useful = word.length() >= 3 && word != "turn" && word != "get" &&
+                          word != "state" && word != "status" && word != "illuminate" &&
+                          word != "switch" && word != "please" && word != "my";
+      if (useful) {
+        for (size_t i = 0; i < DeviceRegistry::bindingSlots(); ++i) {
+          const DeviceBinding *binding = deviceRegistry.bindingAt(i);
+          if (!binding || !binding->occupied) continue;
+          String aliasWords = binding->alias;
+          aliasWords.replace('_', ' ');
+          if (containsAliasWords(aliasWords, word)) {
+            if (!candidateCount) {
+              candidates[0] = binding;
+              names[0] = binding->displayName;
+              candidateCount = 1;
+            } else if (candidates[0] != binding) {
+              candidateCount = 2;  // mark ambiguous
+            }
+          }
+        }
+      }
+      start = end + 1;
+    }
+    if (candidateCount > 1) {
+      handled = true;
+      sendError(id, "ambiguous_device", "Use the full registered device alias");
+      return false;
+    }
+  }
+  if (!candidateCount) {
+    // Prevent a prompt that names an unregistered semantic device from falling
+    // through to the legacy onboard-LED model path.
+    const bool deviceLanguage = normalized.indexOf(" lamp") >= 0 ||
+                                normalized.indexOf(" light") >= 0 ||
+                                normalized.indexOf(" fan") >= 0 ||
+                                normalized.startsWith("turn on ") ||
+                                normalized.startsWith("turn off ") ||
+                                normalized.startsWith("get ");
+    if (deviceLanguage) {
+      handled = true;
+      sendError(id, "device_not_found", "Bind and confirm the named device before controlling it");
+    }
+    return false;
+  }
   handled = true;
 
   TaskRequest request;
   request.priority = TaskPriority::INTERACTIVE;
   float confidence = 1.0f;
   const DeviceBinding *target = candidates[0];
-  if (tinyDecide.ready()) {
+
+  // Explicit, safely grounded command phrases do not need probabilistic
+  // operation classification. TinyDecide remains available for less-direct
+  // phrasing after the deterministic fast path.
+  const bool explicitOn = normalized.startsWith("turn on ") ||
+                          normalized.startsWith("switch on ") ||
+                          normalized.startsWith("enable ") ||
+                          normalized.startsWith("illuminate ") ||
+                          normalized.startsWith("light up ");
+  const bool explicitOff = normalized.startsWith("turn off ") ||
+                           normalized.startsWith("switch off ") ||
+                           normalized.startsWith("disable ");
+  const bool explicitGet = normalized.startsWith("get ") ||
+                           normalized.startsWith("read ") ||
+                           normalized.indexOf(" state") >= 0 ||
+                           normalized.indexOf(" status") >= 0 ||
+                           normalized.startsWith("is ");
+  if (explicitOn || explicitOff || explicitGet) {
+    if (candidateCount != 1) {
+      sendError(id, "ambiguous_device", "Name exactly one registered device");
+      return false;
+    }
+    if (explicitGet) request.operation = TaskOperation::DEVICE_GET;
+    else {
+      request.operation = TaskOperation::DEVICE_SET;
+      request.state = explicitOn;
+    }
+  } else if (tinyDecide.ready()) {
     DeviceRouteResult route = tinyDecide.routeDevice(prompt, names, candidateCount);
     if (route.action == DeviceRouteResult::ERROR || route.action == DeviceRouteResult::UNSUPPORTED ||
         route.targetIndex < 0 || static_cast<size_t>(route.targetIndex) >= candidateCount) {
@@ -500,22 +638,62 @@ bool handleNamedDevicePrompt(const char *id, const String &prompt, const String 
       request.operation = TaskOperation::DEVICE_GET;
     }
   } else {
-    if (normalized.indexOf("turn on") >= 0 || normalized.indexOf("switch on") >= 0) {
-      request.operation = TaskOperation::DEVICE_SET;
-      request.state = true;
-    } else if (normalized.indexOf("turn off") >= 0 || normalized.indexOf("switch off") >= 0) {
-      request.operation = TaskOperation::DEVICE_SET;
-      request.state = false;
-    } else if (normalized.indexOf("state") >= 0 || normalized.indexOf("status") >= 0) {
-      request.operation = TaskOperation::DEVICE_GET;
-    } else {
-      sendError(id, "unsupported_device_prompt", "No supported device operation was found");
-      return false;
-    }
+    sendError(id, "unsupported_device_prompt", "No supported device operation was found");
+    return false;
   }
   strlcpy(request.alias, target->alias, sizeof(request.alias));
   return submitTask(id, request, tinyDecide.ready() ? tinyDecide.name() : "deterministic-device-router",
                     confidence);
+}
+
+bool handleLedPrompt(const char *id, const String &normalized, bool &handled) {
+  handled = normalized.startsWith("led ") || normalized == "led" ||
+            normalized.endsWith(" led") || normalized.indexOf(" led ") >= 0 ||
+            normalized.indexOf("status led") >= 0 ||
+            normalized.indexOf("status light") >= 0 ||
+            normalized.indexOf("onboard led") >= 0;
+  if (!handled) return false;
+
+  if (hasWord(normalized, "off") || hasWord(normalized, "disable")) {
+    TaskRequest request;
+    request.operation = TaskOperation::DEVICE_SET;
+    strlcpy(request.alias, "status_led", sizeof(request.alias));
+    request.state = false;
+    return submitTask(id, request, "deterministic-led-router", 1.0f);
+  }
+
+  LedPattern pattern;
+  if (parsePattern(normalized, pattern)) {
+    RgbValue color;
+    if (parseColor(normalized, color) &&
+        !submitLedColor(id, color.r, color.g, color.b, parseBrightness(normalized, 80))) return false;
+    TaskRequest request;
+    request.operation = TaskOperation::DEVICE_SET_PATTERN;
+    strlcpy(request.alias, "status_led", sizeof(request.alias));
+    request.pattern = pattern;
+    return submitTask(id, request, "deterministic-led-router", 1.0f);
+  }
+
+  RgbValue color;
+  if (parseColor(normalized, color))
+    return submitLedColor(id, color.r, color.g, color.b, parseBrightness(normalized, 80));
+
+  if (normalized.indexOf("brightness") >= 0 || normalized.indexOf("bright") >= 0) {
+    DeviceOperationResult current = deviceRegistry.get("status_led");
+    return submitLedColor(id, current.r, current.g, current.b,
+                          parseBrightness(normalized, current.brightness));
+  }
+
+  if (hasWord(normalized, "on") || hasWord(normalized, "enable")) {
+    TaskRequest request;
+    request.operation = TaskOperation::DEVICE_SET;
+    strlcpy(request.alias, "status_led", sizeof(request.alias));
+    request.state = true;
+    return submitTask(id, request, "deterministic-led-router", 1.0f);
+  }
+
+  sendError(id, "unsupported_color", "Supported colors: red, green, blue, orange, yellow, purple, pink, white");
+  return false;
 }
 
 bool handlePrompt(const char *id, String prompt) {
@@ -524,6 +702,8 @@ bool handlePrompt(const char *id, String prompt) {
   normalized.toLowerCase();
 
   bool handled = false;
+  const bool ledResult = handleLedPrompt(id, normalized, handled);
+  if (handled) return ledResult;
   const bool configurationResult = handleConfigurationPrompt(id, normalized, handled);
   if (handled) return configurationResult;
   const bool deviceResult = handleNamedDevicePrompt(id, prompt, normalized, handled);
@@ -532,18 +712,15 @@ bool handlePrompt(const char *id, String prompt) {
   if (tinyDecide.ready()) {
     TinyDecideResult decision = tinyDecide.interpret(prompt);
     if (decision.action == TinyDecideResult::LED_OFF) {
-      validateAndSetLed(0, 0, 0, 0);
-      sendTinyDecideResponse(id, decision, true);
-      return true;
+      TaskRequest request;
+      request.operation = TaskOperation::DEVICE_SET;
+      strlcpy(request.alias, "status_led", sizeof(request.alias));
+      request.state = false;
+      return submitTask(id, request, tinyDecide.name(), decision.confidence);
     }
     if (decision.action == TinyDecideResult::SET_LED) {
-      if (!validateAndSetLed(decision.r, decision.g, decision.b, decision.brightness)) {
-        sendTinyDecideResponse(id, decision, false, "invalid_model_output",
-                               "Model output failed command validation");
-        return false;
-      }
-      sendTinyDecideResponse(id, decision, true);
-      return true;
+      return submitLedColor(id, decision.r, decision.g, decision.b, decision.brightness,
+                            tinyDecide.name(), decision.confidence);
     }
     if (decision.action == TinyDecideResult::UNSUPPORTED) {
       sendTinyDecideResponse(id, decision, false, "unsupported_prompt",
@@ -559,9 +736,11 @@ bool handlePrompt(const char *id, String prompt) {
     return false;
   }
   if (strcmp(prediction.label, "led.off") == 0 || normalized.indexOf("off") >= 0 || normalized.indexOf("disable") >= 0) {
-    validateAndSetLed(0, 0, 0, 0);
-    sendPromptResponse(id, prediction, true);
-    return true;
+    TaskRequest request;
+    request.operation = TaskOperation::DEVICE_SET;
+    strlcpy(request.alias, "status_led", sizeof(request.alias));
+    request.state = false;
+    return submitTask(id, request, "ngram-fallback", prediction.confidence);
   }
 
   RgbValue color;
@@ -571,9 +750,8 @@ bool handlePrompt(const char *id, String prompt) {
   }
 
   uint8_t brightness = parseBrightness(normalized, 80);
-  validateAndSetLed(color.r, color.g, color.b, brightness);
-  sendPromptResponse(id, prediction, true);
-  return true;
+  return submitLedColor(id, color.r, color.g, color.b, brightness,
+                        "ngram-fallback", prediction.confidence);
 }
 
 bool getByte(JsonObject args, const char *key, uint8_t &value) {
@@ -754,8 +932,11 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
   }
 
   if (strcmp(tool, "led.off") == 0) {
-    validateAndSetLed(0, 0, 0, 0);
-    sendSuccess(id);
+    TaskRequest task;
+    task.operation = TaskOperation::DEVICE_SET;
+    strlcpy(task.alias, "status_led", sizeof(task.alias));
+    task.state = false;
+    submitTask(id, task, "json-tool", 1.0f);
     return;
   }
   if (strcmp(tool, "led.set") == 0) {
@@ -768,8 +949,24 @@ void handleTool(JsonDocument &request, const char *id, const char *tool) {
       sendError(id, "invalid_args", "brightness must be from 0 to 255");
       return;
     }
-    validateAndSetLed(r, g, b, brightness);
-    sendSuccess(id);
+    submitLedColor(id, r, g, b, brightness, "json-tool", 1.0f);
+    return;
+  }
+  if (strcmp(tool, "led.pattern") == 0) {
+    if (!args["pattern"].is<const char *>()) {
+      sendError(id, "invalid_args", "led.pattern requires blink, pulse, rainbow, or solid");
+      return;
+    }
+    LedPattern pattern;
+    if (!parsePattern(args["pattern"].as<String>(), pattern)) {
+      sendError(id, "invalid_args", "Unsupported LED pattern");
+      return;
+    }
+    TaskRequest task;
+    task.operation = TaskOperation::DEVICE_SET_PATTERN;
+    strlcpy(task.alias, "status_led", sizeof(task.alias));
+    task.pattern = pattern;
+    submitTask(id, task, "json-tool", 1.0f);
     return;
   }
   sendError(id, "unknown_tool", "Tool is not registered");
@@ -784,7 +981,6 @@ void handleLine(String line) {
   }
 
   if (line[0] != '{') {
-    setStatus(20, 20, 80);
     handlePrompt("serial", line);
     return;
   }
@@ -802,7 +998,6 @@ void handleLine(String line) {
 
   const char *id = request["id"] | "serial";
   if (request["prompt"].is<const char *>()) {
-    setStatus(20, 20, 80);
     handlePrompt(id, request["prompt"].as<String>());
     return;
   }
@@ -816,10 +1011,6 @@ void handleLine(String line) {
 void setup() {
   Serial.begin(115200);
   delay(250);
-  pixel.begin();
-  pixel.clear();
-  pixel.show();
-  setStatus(0, 0, 80);
   Serial.println("MicroNeedle ESP32-S3 starting");
   deviceRegistry.begin();
   taskExecutor.begin();
@@ -882,8 +1073,6 @@ void setup() {
     Serial.println("Wi-Fi unavailable; serial prompt input remains active.");
   }
 #endif
-
-  setStatus(0, 80, 0);
 }
 
 void loop() {
@@ -901,11 +1090,8 @@ void loop() {
   }
 
   taskExecutor.tick();
+  deviceRegistry.tick();
   TaskRecord event;
-  while (taskExecutor.takeEvent(event)) {
-    sendTaskRecord(nullptr, event, true);
-    if (event.status == TaskStatus::COMPLETED) setStatus(0, 80, 0);
-    else setStatus(80, 0, 0);
-  }
+  while (taskExecutor.takeEvent(event)) sendTaskRecord(nullptr, event, true);
   delay(2);
 }

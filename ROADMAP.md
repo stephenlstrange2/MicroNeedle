@@ -417,3 +417,178 @@ remove desk lamp
 ```
 
 It must provide persistent bindings, reserved-pin validation, safe boot state, structured task results, TinyDecide routing, n-gram recovery, and no direct unvalidated hardware access.
+
+## Remaining Work Plan
+
+The foundation above is functional, but the full roadmap is not complete. Work proceeds in the following milestones, in dependency order.
+
+### Milestone A — Unify the onboard WS2812B with the device architecture
+
+Replace the legacy direct `led.set`/`led.off` path with a built-in system device:
+
+```json
+{
+  "alias": "status_led",
+  "display_name": "Status LED",
+  "driver": "ws2812.rgb",
+  "endpoint": {"node":"local","pin":"KM_RGB_PIN"},
+  "system": true,
+  "capabilities": ["on","off","color","brightness","pattern","state"]
+}
+```
+
+Tasks:
+
+1. Extend `DriverType`, capabilities, commands, task arguments, and task results for RGB values, brightness, and patterns.
+2. Implement `Ws2812RgbDriver` using the configured `KM_RGB_PIN` and prevent user removal/rebinding of system devices.
+3. Register `status_led` during boot without consuming a user GPIO binding slot or persisting board-derived pin data.
+4. Route `led orange`, `led blue`, `make the status light purple`, brightness, off, and pattern requests through the registry and task executor.
+5. Add a deterministic explicit-color fast path; unsupported names such as `brown` return `unsupported_color` rather than invoking an unrelated tool.
+6. Distinguish status signaling from user state so boot/error indicators do not silently overwrite a requested persistent LED color.
+7. Remove direct hardware mutations from prompt and JSON handlers.
+
+Acceptance:
+
+- All WS2812B operations produce task IDs and completion events.
+- GPIO 38 and 48 remain reserved regardless of board revision.
+- `device.describe status_led` exposes accurate capabilities and configured pin.
+- Explicit supported colors execute without model inference.
+
+Implementation status (2026-10-06): implemented in source and firmware-build verified. On-device acceptance checks for physical color/pattern output and event payloads remain pending before declaring the milestone hardware-accepted. See `EVIDENCE.md`.
+
+### Milestone B — Typed tool registry and centralized validation
+
+The current handlers still contain manual branching. Replace them with declarative tool definitions:
+
+1. Create `ToolDefinition`, argument schemas, flags, and handler registration.
+2. Validate types, enums, ranges, required fields, privilege level, and capabilities before task creation.
+3. Generate `device.capabilities` from registered tools and drivers rather than maintaining a manual list.
+4. Give every result a consistent error taxonomy and routing metadata (`deterministic`, `tinydecide`, or fallback).
+5. Move prompt-derived and direct JSON commands through the same validator.
+
+Acceptance:
+
+- Invalid model and transport inputs fail identically.
+- Advertised tools always have implementations.
+- No driver is reachable without tool-schema and capability validation.
+
+### Milestone C — Safe single-owner ingress and transport responses
+
+Serial is currently the supported control path. Make HTTP and later transports production-safe:
+
+1. Add a bounded ingress queue containing request ID, origin, payload, and response handle.
+2. Make the Arduino owner loop the sole mutator of the registry, confirmations, tasks, NVS, GPIO, and user LED state.
+3. Put TinyDecide behind a serialized inference worker/queue so network callbacks never block for several seconds.
+4. Add `ResponseSink` abstractions for serial, HTTP, WebSocket, and future MQTT/BLE transports.
+5. Accumulate chunked HTTP bodies correctly and enforce size limits before parsing.
+6. Return real confirmation IDs, task IDs, confidence, and structured errors to the originating HTTP client.
+7. Add WebSocket/SSE event delivery and task polling for asynchronous completion.
+8. Bind confirmation tokens to origin/session and operation digest.
+
+Acceptance:
+
+- Concurrent serial and HTTP requests cannot interleave or corrupt state.
+- HTTP receives the same structured response as serial.
+- Slow inference does not block health checks or task processing.
+
+### Milestone D — Cooperative task lifecycle
+
+Evolve the synchronous executor into the planned cooperative runtime:
+
+1. Separate active task slots from a bounded completed-result history.
+2. Define `start`, `poll`, `cancel`, and `safeStop` for long-running drivers.
+3. Enforce deadlines before and during operations; report side effects honestly when rollback is impossible.
+4. Implement execution lanes for inference, GPIO, I²C, network, and effects.
+5. Add fair weighted scheduling and emergency critical-task preemption.
+6. Add non-blocking LED patterns and timed GPIO pulses as the first cooperative tasks.
+7. Add explicit task acknowledgement or TTL-based result eviction.
+
+Acceptance:
+
+- Animations and timed outputs do not block input.
+- Cancellation stops cooperative tasks and leaves hardware safe.
+- Completed task history remains queryable until deterministic eviction.
+
+### Milestone E — More local drivers
+
+Implement drivers in this order:
+
+1. `gpio.input` with pull-up/pull-down and debouncing
+2. `gpio.pwm` for fans and dimmable outputs
+3. `adc.input` with scaling/calibration
+4. `i2c.sensor` discovery and typed measurement values
+5. SPI and UART peripheral adapters
+6. Relay profiles with active-low defaults and minimum toggle intervals
+
+Each driver declares resource claims, capabilities, safe startup/shutdown behavior, argument schemas, and state semantics.
+
+Acceptance:
+
+- Users can bind, query, and control each type by alias.
+- Conflicting pin/bus/timer allocations are rejected.
+- Sensor values include units and error/age metadata.
+
+### Milestone F — Retrieval and model routing
+
+Improve language routing without weakening actuator safety:
+
+1. Keep deterministic routing for explicit aliases, colors, and operations.
+2. Add alias synonyms and unique whole-word partial references.
+3. Add deterministic candidate retrieval before TinyDecide.
+4. Support more than 31 registry entries by passing only the best grounded candidates to the model.
+5. Calibrate operation/target thresholds from an on-device acceptance corpus.
+6. Use TinyDecide corrections/prototypes for recurring user phrasing.
+7. Add confirmation bands between automatic execution and refusal.
+8. Report why routing was deterministic, model-assisted, ambiguous, or refused.
+
+Acceptance:
+
+- No substring false positives such as `fan` in `fantastic`.
+- Unknown aliases cannot actuate registered hardware.
+- Accuracy and false-actuation metrics are recorded for a fixed prompt suite.
+
+### Milestone G — Remote nodes and stronger processors
+
+Extend the registry across processors while preserving the command contract:
+
+1. Define node identity, discovery, capability advertisement, health, and protocol version negotiation.
+2. Implement a secure framed UART transport first for attached controllers.
+3. Add ESP-NOW for nearby ESP32 nodes, then authenticated MQTT/HTTP/WebSocket as appropriate.
+4. Implement `remote.device` proxy tasks with timeout, retry, idempotency, and offline behavior.
+5. Require final safety validation at the actuator node.
+6. Add ESP32-P4 and Luckfox Pico Plus runtimes using the same tool/device/task protocol.
+7. Permit stronger nodes to host larger model backends while the ESP32-S3 remains a trusted actuator.
+
+Acceptance:
+
+- `turn on garage light` works identically for local and remote bindings.
+- Offline nodes fail safely with explicit status.
+- Duplicate remote requests do not repeat non-idempotent actions.
+
+### Milestone H — Reliability, security, and maintenance
+
+1. Add native/host tests for alias normalization, board profiles, schemas, queues, deadlines, confirmations, and routing.
+2. Add on-device integration tests for NVS corruption/recovery, active-low safe boot, model partition validation, PSRAM pressure, and brownout/reset behavior.
+3. Add fuzz tests for serial/JSON inputs and persistence records.
+4. Implement factory reset, export/import of bindings, and schema migrations.
+5. Add signed OTA firmware updates that preserve/check model and registry partitions.
+6. Add authentication/authorization policies for configuration versus ordinary control.
+7. Add audit events without logging secrets or sensitive prompts.
+8. Document electrical safety, supported boards, pin maps, and recovery procedures.
+
+Acceptance:
+
+- CI builds firmware and runs host tests.
+- Upgrade, rollback, corrupted state, and low-memory cases have documented recovery.
+- Privileged configuration is unavailable to unauthenticated remote transports.
+
+### Recommended immediate execution sequence
+
+1. Milestone A: built-in WS2812B driver and deterministic color routing
+2. Milestone B: typed tools and centralized validation
+3. Milestone C: safe ingress queue and response sinks
+4. Milestone D: cooperative patterns/timed tasks
+5. Milestone E: GPIO input and PWM
+6. Milestone F: retrieval and calibrated TinyDecide routing
+7. Milestone G: remote UART node, then ESP-NOW/Luckfox
+8. Milestone H continuously alongside every milestone

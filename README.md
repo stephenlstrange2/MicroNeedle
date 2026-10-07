@@ -26,7 +26,23 @@ Direct validated tools remain available:
 {"v":1,"id":"1","tool":"led.set","args":{"r":255,"g":80,"b":0,"brightness":80}}
 ```
 
-A TinyDecide response reports its decision, confidence, extracted arguments, latency, token count, and truncation state.
+Explicit LED colors are routed deterministically; less-direct language may use TinyDecide. Every LED mutation is submitted to the bounded task executor and produces a task completion event.
+
+The onboard WS2812B is exposed as the built-in, non-removable `status_led` device. It supports on/off, RGB color, brightness, state, and non-blocking `blink`, `pulse`, and `rainbow` patterns:
+
+```text
+led orange
+make the status light purple brightness 40
+status led rainbow
+turn off status led
+```
+
+```json
+{"v":1,"id":"d1","tool":"device.describe","args":{"alias":"status_led"}}
+{"v":1,"id":"p1","tool":"led.pattern","args":{"pattern":"pulse"}}
+```
+
+Unsupported explicit colors, such as `led brown`, return `unsupported_color` without model inference or hardware access.
 
 ## One-time model setup
 

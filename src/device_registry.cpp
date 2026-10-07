@@ -75,7 +75,21 @@ bool DeviceRegistry::begin() {
     }
   }
   if (sanitized) save();
-  return true;
+  return initializeSystemLed();
+}
+
+bool DeviceRegistry::initializeSystemLed() {
+  memset(&systemLed_, 0, sizeof(systemLed_));
+  systemLed_.id = 0;
+  strlcpy(systemLed_.alias, "status_led", sizeof(systemLed_.alias));
+  strlcpy(systemLed_.displayName, "Status LED", sizeof(systemLed_.displayName));
+  systemLed_.driver = DriverType::WS2812_RGB;
+  systemLed_.pin = KM_RGB_PIN;
+  systemLed_.capabilities = CAP_ON | CAP_OFF | CAP_STATE | CAP_COLOR |
+                            CAP_BRIGHTNESS | CAP_PATTERN;
+  systemLed_.occupied = true;
+  DeviceDriver *driver = driverFor(systemLed_.driver);
+  return driver && driver->begin(systemLed_);
 }
 
 bool DeviceRegistry::load() {
@@ -167,6 +181,7 @@ DeviceOperationResult DeviceRegistry::bindGpioOutput(const char *displayName, ui
 DeviceOperationResult DeviceRegistry::unbind(const char *alias) {
   DeviceBinding *binding = find(alias);
   if (!binding) return {false, "device_not_found", false};
+  if (isSystemDevice(binding)) return {false, "system_device_immutable", binding->currentOn};
   DeviceBinding previous = *binding;
   DeviceDriver *driver = driverFor(binding->driver);
   if (driver) driver->safeStop(*binding);
@@ -185,6 +200,7 @@ DeviceOperationResult DeviceRegistry::unbind(const char *alias) {
 DeviceOperationResult DeviceRegistry::rename(const char *alias, const char *newDisplayName) {
   DeviceBinding *binding = find(alias);
   if (!binding) return {false, "device_not_found", false};
+  if (isSystemDevice(binding)) return {false, "system_device_immutable", binding->currentOn};
   char normalized[MICRONEEDLE_ALIAS_SIZE];
   if (!normalizeAlias(newDisplayName, normalized, sizeof(normalized))) return {false, "invalid_alias", false};
   DeviceBinding *existing = find(normalized);
@@ -208,6 +224,25 @@ DeviceOperationResult DeviceRegistry::set(const char *alias, bool on) {
   return driver->set(*binding, on);
 }
 
+DeviceOperationResult DeviceRegistry::setRgb(const char *alias, uint8_t r, uint8_t g,
+                                               uint8_t b, uint8_t brightness) {
+  DeviceBinding *binding = find(alias);
+  if (!binding) return {false, "device_not_found", false};
+  if (!(binding->capabilities & CAP_COLOR)) return {false, "operation_not_supported", false};
+  DeviceDriver *driver = driverFor(binding->driver);
+  return driver ? driver->setRgb(*binding, r, g, b, brightness)
+                : DeviceOperationResult{false, "driver_unavailable"};
+}
+
+DeviceOperationResult DeviceRegistry::setPattern(const char *alias, LedPattern pattern) {
+  DeviceBinding *binding = find(alias);
+  if (!binding) return {false, "device_not_found", false};
+  if (!(binding->capabilities & CAP_PATTERN)) return {false, "operation_not_supported", false};
+  DeviceDriver *driver = driverFor(binding->driver);
+  return driver ? driver->setPattern(*binding, pattern)
+                : DeviceOperationResult{false, "driver_unavailable"};
+}
+
 DeviceOperationResult DeviceRegistry::get(const char *alias) {
   DeviceBinding *binding = find(alias);
   if (!binding) return {false, "device_not_found", false};
@@ -220,6 +255,7 @@ DeviceOperationResult DeviceRegistry::get(const char *alias) {
 DeviceBinding *DeviceRegistry::find(const char *alias) {
   char normalized[MICRONEEDLE_ALIAS_SIZE];
   if (!normalizeAlias(alias, normalized, sizeof(normalized))) return nullptr;
+  if (systemLed_.occupied && strcmp(systemLed_.alias, normalized) == 0) return &systemLed_;
   for (auto &binding : bindings_) {
     if (binding.occupied && strcmp(binding.alias, normalized) == 0) return &binding;
   }
@@ -231,11 +267,13 @@ const DeviceBinding *DeviceRegistry::find(const char *alias) const {
 }
 
 DeviceBinding *DeviceRegistry::bindingAt(size_t slot) {
-  return slot < MICRONEEDLE_MAX_DEVICES ? &bindings_[slot] : nullptr;
+  if (slot < MICRONEEDLE_MAX_DEVICES) return &bindings_[slot];
+  return slot == MICRONEEDLE_MAX_DEVICES ? &systemLed_ : nullptr;
 }
 
 const DeviceBinding *DeviceRegistry::bindingAt(size_t slot) const {
-  return slot < MICRONEEDLE_MAX_DEVICES ? &bindings_[slot] : nullptr;
+  if (slot < MICRONEEDLE_MAX_DEVICES) return &bindings_[slot];
+  return slot == MICRONEEDLE_MAX_DEVICES ? &systemLed_ : nullptr;
 }
 
 size_t DeviceRegistry::count() const {
@@ -244,7 +282,18 @@ size_t DeviceRegistry::count() const {
   return total;
 }
 
+size_t DeviceRegistry::visibleCount() const {
+  return count() + (systemLed_.occupied ? 1 : 0);
+}
+
+void DeviceRegistry::tick() {
+  if (!systemLed_.occupied) return;
+  DeviceDriver *driver = driverFor(systemLed_.driver);
+  if (driver) driver->tick(systemLed_);
+}
+
 bool DeviceRegistry::pinClaimed(uint8_t pin) const {
+  if (systemLed_.occupied && systemLed_.pin == pin) return true;
   for (const auto &binding : bindings_) {
     if (binding.occupied && binding.pin == pin) return true;
   }
